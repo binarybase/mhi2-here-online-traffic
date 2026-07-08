@@ -1,0 +1,25 @@
+# ── Secrets — NEVER commit ──────────────────────────────────────────────
+*.key
+here.key
+tomtom.key
+.here_key
+.tomtom_key
+
+# ── Proprietary Audi firmware (extract your own; do not redistribute) ────
+firmware/
+*.jar
+*.kzb
+
+# ── Captured third-party API data (HERE/TomTom responses) ────────────────
+backend/samples/
+*.tpg
+traffic_data.*
+
+# ── Build artifacts ──────────────────────────────────────────────────────
+build/
+backend/build/
+*.o
+*.class
+
+# ── OS / editor ──────────────────────────────────────────────────────────
+.DS_Store
