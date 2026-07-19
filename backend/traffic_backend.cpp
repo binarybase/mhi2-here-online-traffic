@@ -47,6 +47,10 @@
 
 #include <zlib.h>
 
+#include "here_source.h"
+#include "here_fetch.h"
+#include "tpeg_encode.h"
+
 // ── Empty TPEG envelope (raw, on-disk decrypted form). ────────────────────────
 // Captured from the live SI session: a valid TISA TPEG2 container carrying zero
 // messages. The native decoder parses this as "no traffic in area".
@@ -55,11 +59,35 @@ static const unsigned char EMPTY_TPEG[] = {
 };
 static const int EMPTY_TPEG_LEN = (int) sizeof(EMPTY_TPEG);
 
+// Last successfully built TPEG stream. On a transient fetch failure (cellular
+// handover, tunnel, border crossing) we keep serving this instead of blanking
+// the overlay to EMPTY_TPEG, up to LAST_TPEG_MAX_AGE_S old.
+static std::string g_last_tpeg;
+static time_t      g_last_tpeg_time = 0;
+static const int   LAST_TPEG_MAX_AGE_S = 600;   // 10 min
+// Number of fetch attempts per poll before giving up (covers brief drops).
+static const int   HERE_FETCH_ATTEMPTS = 3;
+// If the incidents fetch (incl. retries) already burned this many ms, skip the
+// optional flow overlay this poll so a degraded link can't stack a second
+// multi-second stall — incidents matter more than flow colouring.
+static const long  FLOW_SKIP_AFTER_MS = 6000;
+
 // Update intervals advertised back to the bundle (seconds).
 static const int FREQ_LONG_S  = 120;
 static const int FREQ_SHORT_S = 30;
 
+// Radius (metres) of the HERE query circle around the head unit's position.
+// Native Audi Connect lists ~220 incidents spanning ~60 km around the car.
+// 50 km is HERE's maximum allowed circle radius and returns ~180 incidents,
+// covering a comparable region.
+static const int  HERE_RADIUS_M = 50000;
+// Max incidents pulled per request.
+static const int  HERE_MAX_INCIDENTS = 256;
+// Max flow segments pulled per request.
+static const int  HERE_MAX_FLOW = 256;
+
 static FILE* g_log = NULL;
+static std::string g_here_key;   // HERE apiKey (loaded at startup; never logged)
 
 static void logf(const char* fmt, ...) {
     char ts[32];
@@ -203,6 +231,131 @@ static void log_position(const std::string& xml) {
     }
 }
 
+// Parse the first <lat>/<lon> pair from the getMessages XML into doubles.
+// Returns true if both were present and look like plausible coordinates.
+static bool parse_position(const std::string& xml, double& lat, double& lon) {
+    size_t la = xml.find("<lat>");
+    size_t lo = xml.find("<lon>");
+    if (la == std::string::npos || lo == std::string::npos) return false;
+    lat = atof(xml.c_str() + la + 5);
+    lon = atof(xml.c_str() + lo + 5);
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return false;
+    if (lat == 0.0 && lon == 0.0) return false;
+    return true;
+}
+
+// Fetch HERE incidents around (lat,lon), encode them into a TPEG stream.
+// Returns true and fills `out` on success; false => caller falls back to empty.
+static bool build_tpeg_response(double lat, double lon, std::string& out) {
+    if (g_here_key.empty()) return false;
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    std::string json;
+    int status = 0;
+    for (int attempt = 0; attempt < HERE_FETCH_ATTEMPTS; ++attempt) {
+        status = here_fetch("incidents", lat, lon, HERE_RADIUS_M,
+                            g_here_key.c_str(), json);
+        if (status == 200 && !json.empty()) break;
+        if (attempt + 1 < HERE_FETCH_ATTEMPTS) {
+            logf("  HERE incidents fetch attempt %d failed (status=%d); retrying",
+                 attempt + 1, status);
+            usleep(500000);   // 0.5s backoff before retry
+        }
+    }
+    if (status != 200 || json.empty()) {
+        logf("  HERE fetch failed (status=%d, %lu bytes)",
+             status, (unsigned long) json.size());
+        return false;
+    }
+
+    here_incident_t* incs =
+        (here_incident_t*) malloc(sizeof(here_incident_t) * HERE_MAX_INCIDENTS);
+    if (!incs) return false;
+
+    int count = 0;
+    int rc = here_parse_incidents(json.data(), json.size(),
+                                  incs, HERE_MAX_INCIDENTS, &count);
+    if (rc != 0) {
+        logf("  HERE JSON parse error (rc=%d)", rc);
+        free(incs);
+        return false;
+    }
+
+    int n = count < HERE_MAX_INCIDENTS ? count : HERE_MAX_INCIDENTS;
+
+    tpeg_enc_t enc;
+    if (tpeg_enc_init(&enc)) { free(incs); return false; }
+    tpeg_enc_begin(&enc);
+    // Stamp messages with real UTC time. The head unit's own clock reads ~1970
+    // until it gets a GPS fix, which would make the stream look stale; fall back
+    // to the wall-clock time HERE reports in its Date header.
+    unsigned int gen = (unsigned int) time(NULL);
+    if (gen < 1577836800u) {                 // < 2020-01-01 => local clock unset
+        time_t srv = here_last_server_time();
+        if (srv > 0) gen = (unsigned int) srv;
+    }
+    int written = 0;
+    for (int i = 0; i < n; ++i) {
+        if (tpeg_enc_add_incident(&enc, gen, 1, &incs[i]) == 0) written++;
+    }
+
+    // Real-time flow overlay (best-effort; failure just omits flow).
+    // Skip it entirely if the incidents fetch already ran long, so a degraded
+    // link doesn't stack a second multi-second stall onto this poll.
+    int flow_written = 0;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long inc_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                  (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    if (inc_ms >= FLOW_SKIP_AFTER_MS) {
+        logf("  incidents fetch took %ld ms; skipping flow overlay this poll",
+             inc_ms);
+    } else {
+        std::string fjson;
+        int fstatus = here_fetch("flow", lat, lon, HERE_RADIUS_M,
+                                 g_here_key.c_str(), fjson);
+        if (fstatus == 200 && !fjson.empty()) {
+            here_flow_t* flows =
+                (here_flow_t*) malloc(sizeof(here_flow_t) * HERE_MAX_FLOW);
+            if (flows) {
+                int fcount = 0;
+                if (here_parse_flow(fjson.data(), fjson.size(),
+                                    flows, HERE_MAX_FLOW, &fcount) == 0) {
+                    int fn = fcount < HERE_MAX_FLOW ? fcount : HERE_MAX_FLOW;
+                    for (int i = 0; i < fn; ++i) {
+                        if (tpeg_enc_add_flow(&enc, gen, 1, &flows[i]) == 0)
+                            flow_written++;
+                    }
+                }
+                free(flows);
+            }
+        } else if (fstatus != 200) {
+            logf("  HERE flow fetch failed (status=%d)", fstatus);
+        }
+    }
+
+    tpeg_enc_finish(&enc);
+
+    bool ok = !enc.error && enc.len > 0;
+    if (ok) out.assign((const char*) enc.buf, enc.len);
+
+    struct timespec t2;
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    long total_ms = (t2.tv_sec - t0.tv_sec) * 1000L +
+                    (t2.tv_nsec - t0.tv_nsec) / 1000000L;
+    logf("  HERE: %d incidents (%d w/OLR) + %d flow -> %lu-byte TPEG "
+         "(inc %ld ms, total %ld ms)",
+         count, written, flow_written, (unsigned long) enc.len,
+         inc_ms, total_ms);
+
+    tpeg_enc_free(&enc);
+    free(incs);
+    return ok;
+}
+
+
 // Persist the raw + inflated request for offline analysis / encoder work.
 static void save_capture(int tid, const unsigned char* raw, size_t raw_len,
                          const std::string& xml) {
@@ -215,6 +368,15 @@ static void save_capture(int tid, const unsigned char* raw, size_t raw_len,
         f = fopen(path, "wb");
         if (f) { fwrite(xml.data(), 1, xml.size(), f); fclose(f); }
     }
+}
+
+// Persist the generated TPEG response so it can be diffed against the native
+// service's decrypted stream (/tmp/traffic_data.N).
+static void save_response(int tid, const unsigned char* tpeg, size_t len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/ot_resp_%d.tpg", tid);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(tpeg, 1, len, f); fclose(f); }
 }
 
 // ── Handle one connection. ────────────────────────────────────────────────────
@@ -263,6 +425,7 @@ static void handle_conn(int fd) {
     }
 
     // Inflate + log the request payload (null-key path => plain gzip(XML)).
+    std::string req_xml;
     if (!body.empty()) {
         std::string xml;
         bool ok = gunzip((const unsigned char*) body.data(), body.size(), xml);
@@ -271,6 +434,7 @@ static void handle_conn(int fd) {
                  (unsigned long) body.size(), (unsigned long) xml.size());
             log_position(xml);
             save_capture(tid, (const unsigned char*) body.data(), body.size(), xml);
+            req_xml = xml;
         } else {
             logf("  request body not gzip (%lu bytes) — key may still be set",
                  (unsigned long) body.size());
@@ -278,7 +442,50 @@ static void handle_conn(int fd) {
         }
     }
 
-    // Build response. Null-key path => body is RAW TPEG (no gzip, no AES).
+    // Build the response body. Null-key path => RAW TPEG (no gzip, no AES).
+    // If we can read the head unit's position and have a HERE key, fetch live
+    // incidents and encode them; otherwise fall back to the empty envelope.
+    std::string tpeg;
+    // DEBUG replay hook: if /tmp/replay.tpg exists, serve it verbatim. Lets us
+    // feed the decoder a known-good native stream to isolate encoder vs. plumbing.
+    {
+        FILE* rf = fopen("/tmp/replay.tpg", "rb");
+        if (rf) {
+            fseek(rf, 0, SEEK_END); long rn = ftell(rf); fseek(rf, 0, SEEK_SET);
+            if (rn > 0) {
+                tpeg.resize((size_t) rn);
+                if (fread(&tpeg[0], 1, (size_t) rn, rf) != (size_t) rn) tpeg.clear();
+            }
+            fclose(rf);
+            if (!tpeg.empty()) logf("  REPLAY: serving /tmp/replay.tpg (%ld bytes)", rn);
+        }
+    }
+    double lat, lon;
+    if (tpeg.empty() && !req_xml.empty() && parse_position(req_xml, lat, lon)) {
+        build_tpeg_response(lat, lon, tpeg);
+    }
+    // Serve the last good stream on a transient failure so the traffic overlay
+    // doesn't blink out during a handover/tunnel/border crossing.
+    if (!tpeg.empty()) {
+        g_last_tpeg = tpeg;
+        g_last_tpeg_time = time(NULL);
+    } else if (!g_last_tpeg.empty() &&
+               (time(NULL) - g_last_tpeg_time) <= LAST_TPEG_MAX_AGE_S) {
+        tpeg = g_last_tpeg;
+        logf("  fetch failed; serving cached TPEG (%ld s old, %lu bytes)",
+             (long)(time(NULL) - g_last_tpeg_time),
+             (unsigned long) tpeg.size());
+    }
+    const unsigned char* resp_body;
+    int resp_body_len;
+    if (!tpeg.empty()) {
+        resp_body = (const unsigned char*) tpeg.data();
+        resp_body_len = (int) tpeg.size();
+    } else {
+        resp_body = EMPTY_TPEG;
+        resp_body_len = EMPTY_TPEG_LEN;
+    }
+
     int resp_tid = (tid >= 0) ? tid + 1 : 1;
 
     char date[64];
@@ -298,11 +505,12 @@ static void handle_conn(int fd) {
         "Date: %s\r\n"
         "Connection: close\r\n"
         "\r\n",
-        EMPTY_TPEG_LEN, resp_tid, FREQ_LONG_S, FREQ_SHORT_S, date);
+        resp_body_len, resp_tid, FREQ_LONG_S, FREQ_SHORT_S, date);
 
     write_all(fd, hdr, (size_t) hlen);
-    write_all(fd, (const char*) EMPTY_TPEG, (size_t) EMPTY_TPEG_LEN);
-    logf("  -> 200 OK, %d-byte empty TPEG, tid=%d", EMPTY_TPEG_LEN, resp_tid);
+    write_all(fd, (const char*) resp_body, (size_t) resp_body_len);
+    if (!tpeg.empty()) save_response(tid, resp_body, (size_t) resp_body_len);
+    logf("  -> 200 OK, %d-byte TPEG, tid=%d", resp_body_len, resp_tid);
 }
 
 // ── Self-test client: POST a synthetic gzip(getMessages) to host:port. ────────
@@ -367,35 +575,99 @@ static bool selftest_client(const char* host, int port) {
            (unsigned long) body.size(), (unsigned long) strlen(xml), host, port);
     printf("--- response headers ---\n%s\n", rhead.c_str());
     printf("--- response body (%lu bytes) ---\n", (unsigned long) rbody.size());
-    for (size_t i = 0; i < rbody.size(); ++i)
+    size_t dump_n = rbody.size() < 64 ? rbody.size() : 64;
+    for (size_t i = 0; i < dump_n; ++i)
         printf("%02x ", (unsigned char) rbody[i]);
+    if (dump_n < rbody.size()) printf("... (+%lu more)",
+                                      (unsigned long)(rbody.size() - dump_n));
     printf("\n");
 
     bool status_ok = (rhead.find("200") != std::string::npos);
     bool tid_ok    = (header_value(rhead.substr(rhead.find("\r\n") + 2), "tid") == "6");
-    bool body_ok   = (rbody.size() == (size_t) EMPTY_TPEG_LEN) &&
-                     (memcmp(rbody.data(), EMPTY_TPEG, EMPTY_TPEG_LEN) == 0);
+    // A valid response is a TISA TPEG2 container (envelope magic ff 0f ..): either
+    // the empty envelope (no traffic) or a populated stream. Both are acceptable.
+    bool is_envelope = (rbody.size() >= (size_t) EMPTY_TPEG_LEN) &&
+                       ((unsigned char) rbody[0] == 0xff &&
+                        (unsigned char) rbody[1] == 0x0f);
+    bool is_empty    = (rbody.size() == (size_t) EMPTY_TPEG_LEN) &&
+                       (memcmp(rbody.data(), EMPTY_TPEG, EMPTY_TPEG_LEN) == 0);
+    bool body_ok     = is_envelope;
+    const char* body_kind = is_empty ? "OK(empty-envelope)"
+                          : is_envelope ? "OK(populated-stream)" : "FAIL";
     printf("SELFTEST: status=%s tid=%s body=%s => %s\n",
            status_ok ? "OK" : "FAIL", tid_ok ? "OK(6)" : "FAIL",
-           body_ok ? "OK(empty-envelope)" : "FAIL",
+           body_kind,
            (status_ok && tid_ok && body_ok) ? "PASS" : "FAIL");
     return status_ok && tid_ok && body_ok;
+}
+
+// One-shot dump mode (-D lat lon outfile): fetch HERE for a position, encode a
+// TPEG stream, write it to a file and exit. Used to generate an "ours" stream on
+// the head unit for direct comparison against the native /tmp/traffic_data.N.
+static int dump_mode(double lat, double lon, const char* outfile) {
+    if (g_here_key.empty()) {
+        fprintf(stderr, "DUMP: no HERE key (use -k or $HERE_KEY)\n");
+        return 1;
+    }
+    std::string tpeg;
+    if (!build_tpeg_response(lat, lon, tpeg) || tpeg.empty()) {
+        fprintf(stderr, "DUMP: build_tpeg_response failed\n");
+        return 1;
+    }
+    FILE* f = fopen(outfile, "wb");
+    if (!f) { fprintf(stderr, "DUMP: cannot open %s\n", outfile); return 1; }
+    fwrite(tpeg.data(), 1, tpeg.size(), f);
+    fclose(f);
+    printf("DUMP: wrote %lu-byte TPEG for %.5f,%.5f -> %s\n",
+           (unsigned long) tpeg.size(), lat, lon, outfile);
+    return 0;
+}
+
+// Load the HERE apiKey from (in order): explicit path, $HERE_KEY, or a default
+// key file. The value is stored in g_here_key and never logged.
+static void load_here_key(const char* path) {
+    if (path && *path) {
+        FILE* f = fopen(path, "rb");
+        if (f) {
+            char b[256]; size_t n = fread(b, 1, sizeof(b) - 1, f); fclose(f);
+            b[n] = 0;
+            while (n && (b[n-1] == '\n' || b[n-1] == '\r' || b[n-1] == ' ')) b[--n] = 0;
+            if (n) { g_here_key = b; return; }
+        }
+    }
+    const char* env = getenv("HERE_KEY");
+    if (env && *env) { g_here_key = env; return; }
 }
 
 int main(int argc, char** argv) {
     const char* bind_ip = "0.0.0.0";
     int port = 8099;
     const char* logfile = "/tmp/traffic_backend.log";
+    const char* keyfile = "/mnt/app/armle/etc/here.key";
     bool selftest = false;
+    bool dump = false;
+    double dump_lat = 0, dump_lon = 0;
+    const char* dump_out = "/tmp/ot_ours.tpg";
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) bind_ip = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) logfile = argv[++i];
+        else if (!strcmp(argv[i], "-k") && i + 1 < argc) keyfile = argv[++i];
         else if (!strcmp(argv[i], "-T")) selftest = true;
+        else if (!strcmp(argv[i], "-D") && i + 3 < argc) {
+            dump = true;
+            dump_lat = atof(argv[++i]);
+            dump_lon = atof(argv[++i]);
+            dump_out = argv[++i];
+        }
     }
 
+    load_here_key(keyfile);
+
     signal(SIGPIPE, SIG_IGN);
+
+    if (dump) return dump_mode(dump_lat, dump_lon, dump_out);
 
     // ── Self-test client mode (-T): exercise a running server over loopback. ──
     // Builds a synthetic gzip(getMessages XML) request identical in shape to the
@@ -430,7 +702,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    logf("traffic_backend listening on %s:%d (empty-TPEG echo + capture)", bind_ip, port);
+    logf("traffic_backend listening on %s:%d (HERE key: %s)", bind_ip, port,
+         g_here_key.empty() ? "MISSING — empty-TPEG only" : "loaded");
 
     for (;;) {
         struct sockaddr_in cli;
