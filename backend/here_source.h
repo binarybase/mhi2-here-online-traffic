@@ -33,6 +33,15 @@ typedef struct {
     double speed;             /* current speed (m/s)                        */
     double free_flow;         /* free-flow speed (m/s)                      */
     int    has_olr;           /* 1 if olr was present                       */
+    /* TMC location reference (location.tmc). The head unit resolves TMC
+     * location codes natively but cannot decode OpenLR, so only TMC-referenced
+     * flow renders. Populated only when HERE returns a tmc object.            */
+    int    has_tmc;
+    int    tmc_cc;            /* ebuCountryCode, hex digit -> int (CZ = 2)   */
+    int    tmc_ltn;           /* tableId / location table number (CZ = 25)   */
+    int    tmc_loc;           /* locationId (16-bit TMC location code)       */
+    int    tmc_dir;           /* queuingDirection: 0 = "+", 1 = "-"          */
+    int    tmc_extent;        /* extent (number of TMC steps)               */
 } here_flow_t;
 
 /* One traffic incident. */
@@ -44,7 +53,18 @@ typedef struct {
     char start_time[HERE_TIME_MAX];
     char end_time[HERE_TIME_MAX];
     int  road_closed;             /* 0/1                                     */
+    int  alertc_code;             /* codes[0]: AlertC/TMC event (ISO 14819-2),
+                                     0 if absent. Primary/most-specific code. */
     int  has_olr;
+    /* TMC location reference (location.tmc). The head unit resolves TMC
+     * location codes natively (on-device TMC table) — unlike OpenLR which it
+     * cannot decode. Populated only when HERE returns a tmc object.           */
+    int  has_tmc;
+    int  tmc_cc;                  /* ebuCountryCode, hex digit -> int (CZ = 2) */
+    int  tmc_ltn;                 /* tableId / location table number (CZ = 25) */
+    int  tmc_loc;                 /* locationId (16-bit TMC location code)     */
+    int  tmc_dir;                 /* queuingDirection: 0 = "+", 1 = "-"        */
+    int  tmc_extent;             /* extent (number of TMC steps)              */
 } here_incident_t;
 
 /*
