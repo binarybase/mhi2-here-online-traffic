@@ -31,6 +31,12 @@ REMAP="${REMAP:-SI}"
 # Data-source redirect: point getMessages at our on-device backend + null the
 # AES key. Set REDIRECT_URL=none to build the remap-only jar (old behaviour).
 REDIRECT_URL="${REDIRECT_URL:-http://10.173.189.1:8099/traffic}"
+# Runtime toggle: the patched bundle uses the HERE backend only while this file
+# exists on the JVM host; otherwise it uses the stock TomTom path. The patch is
+# permanent — flip backends live (no reboot) with:
+#   ssh $SSH_HOST 'touch /mnt/persist/traffic_backend_here'   # -> HERE
+#   ssh $SSH_HOST 'rm -f  /mnt/persist/traffic_backend_here'  # -> TomTom
+FLAG_FILE="${FLAG_FILE:-/mnt/persist/traffic_backend_here}"
 # CAPTURE mode: force every request <loc> to a fixed busy point so a parked poll
 # returns a real non-empty TPEG sample. Use with REDIRECT_URL=none (hit real
 # TomTom, key intact). e.g. REDIRECT_URL=none CAPTURE_LATLON=46.0569,14.5058
@@ -68,13 +74,13 @@ echo "javac: $("$JAVAC" -version 2>&1)"
 echo "Compiling patcher..."
 "$JAVAC" -cp "$JAVASSIST" -d "$BUILD_DIR" "${SCRIPT_DIR}/PatchOnlineTraffic.java"
 
-echo "Patching bundle (HR -> ${REMAP}; redirect -> ${REDIRECT_URL}; capture -> ${CAPTURE_LATLON})..."
+echo "Patching bundle (HR -> ${REMAP}; redirect -> ${REDIRECT_URL}; toggle-flag -> ${FLAG_FILE}; capture -> ${CAPTURE_LATLON})..."
 if [ "$CAPTURE_LATLON" != "none" ]; then
     DEPS_ARG="$CAPTURE_DEPS"
 else
     DEPS_ARG="none"
 fi
-"$JAVA" -cp "${JAVASSIST}:${BUILD_DIR}" PatchOnlineTraffic "$ORIG_BUNDLE" "$OUT_JAR" "$REMAP" "$REDIRECT_URL" "$CAPTURE_LATLON" "$DEPS_ARG"
+"$JAVA" -cp "${JAVASSIST}:${BUILD_DIR}" PatchOnlineTraffic "$ORIG_BUNDLE" "$OUT_JAR" "$REMAP" "$REDIRECT_URL" "$CAPTURE_LATLON" "$DEPS_ARG" "$FLAG_FILE"
 
 # ── Pre-flight: structural verification of the patched class ──────────────────
 # javap -v fully parses the Code attribute (max_stack/max_locals/bytecode). If the

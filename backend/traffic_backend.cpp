@@ -70,7 +70,7 @@ static const int   HERE_FETCH_ATTEMPTS = 3;
 // If the incidents fetch (incl. retries) already burned this many ms, skip the
 // optional flow overlay this poll so a degraded link can't stack a second
 // multi-second stall — incidents matter more than flow colouring.
-static const long  FLOW_SKIP_AFTER_MS = 6000;
+static const long  FLOW_SKIP_AFTER_MS = 30000;
 
 // Update intervals advertised back to the bundle (seconds).
 static const int FREQ_LONG_S  = 120;
@@ -83,8 +83,13 @@ static const int FREQ_SHORT_S = 30;
 static const int  HERE_RADIUS_M = 50000;
 // Max incidents pulled per request.
 static const int  HERE_MAX_INCIDENTS = 256;
-// Max flow segments pulled per request.
-static const int  HERE_MAX_FLOW = 256;
+// Max flow segments pulled per request. HERE returns ~2700 segments for the
+// 50 km circle; only ~25% carry a TMC code the car's table can resolve. The
+// encoder caps the actual emitted volume to keep the TPEG envelope under the
+// 16-bit length limit (TPEG_ENVELOPE_BUDGET) — a larger stream is rejected
+// wholesale by the head unit's parser (checksum failure), so this is just the
+// candidate pool the encoder fills that budget from.
+static const int  HERE_MAX_FLOW = 1024;
 
 static FILE* g_log = NULL;
 static std::string g_here_key;   // HERE apiKey (loaded at startup; never logged)
@@ -324,10 +329,9 @@ static bool build_tpeg_response(double lat, double lon, std::string& out) {
                 if (here_parse_flow(fjson.data(), fjson.size(),
                                     flows, HERE_MAX_FLOW, &fcount) == 0) {
                     int fn = fcount < HERE_MAX_FLOW ? fcount : HERE_MAX_FLOW;
-                    for (int i = 0; i < fn; ++i) {
-                        if (tpeg_enc_add_flow(&enc, gen, 1, &flows[i]) == 0)
-                            flow_written++;
-                    }
+                    /* Emit each HERE segment as its own extent=1 TMC point
+                     * (chaining is disabled in the encoder). */
+                    flow_written += tpeg_enc_add_flows(&enc, gen, 1, flows, fn);
                 }
                 free(flows);
             }

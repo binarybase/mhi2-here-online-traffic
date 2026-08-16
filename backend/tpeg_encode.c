@@ -554,85 +554,145 @@ static int emit_flow_message(tpeg_enc_t *e, unsigned int id, unsigned char versi
 }
 
 /* Real-time flow (TPEG2-TFP, AID 7 / SCID 2). One HERE flow segment becomes one
- * TFP message: a FlowMatrix (comp 06) holding a single FlowVector (comp 07) with
- * one FlowVectorSection, plus a TMC LocationReferencing container (comp 02).
+ * TFP message: a FlowMatrix (comp 06) holding a FlowVector (comp 07) with one or
+ * more FlowVectorSections, plus a TMC LocationReferencing container (comp 02).
  *
- * Byte layout (all lengths single-byte; validated against the native TomTom
- * stream, see /memories/repo/tpeg-capture.md "TFP GRAMMAR FULLY DECODED"):
- *   06 L6 | 06 startTime(4=0) optSel(00) spatialRes(00=TMCLocations)
- *         | 07 L7 | A7 timeOffset(00) count(01)
- *                 | spatialOffset statusSel(70) LOS avgSpeed ffTT(varint) sectionSel(00)
+ * Native TomTom flow carries MULTIPLE FlowVectorSections per message (count 3..7,
+ * each with its own LOS/speed/travel-time). HERE gives the same granularity via
+ * currentFlow.subSegments[] — metric sub-ranges of the TMC location. So when >=2
+ * sub-segments are present we emit one section per sub-segment (spatialResolution
+ * 0x03 = 100 m, the sub-segment length in 100 m units as the spatial offset),
+ * mirroring native's multi-section structure. Otherwise we keep the single
+ * whole-location section at TMC resolution (the byte-exact form already validated
+ * on-device).
+ *
+ * Byte layout (lengths are base-128 varints, single byte while <128; validated
+ * against the native TomTom stream, see /memories/repo/tpeg-capture.md):
+ *   06 L6 | A6 startTime(4=0) optSel(00) spatialRes(00 TMCLoc | 03 100m)
+ *         | 07 L7 | A7 timeOffset(00) count(N)
+ *                 | N× [ spatialOffset statusSel(70) LOS avgSpeed ffTT(varint) sectionSel(00) ]
  *                 | trailer(00)
  *   02 0a 00 02 07 06 loc_hi loc_lo cc ltn flags extent
  *
  * Only TMC-referenced flow is emitted; this head unit cannot resolve OpenLR
  * line locations, so OLR-only flow would never render (and is skipped). */
+
+/* LevelOfService (TPEG2-TFP tfp003, Table 16) from HERE jamFactor 0..10. */
+static unsigned char los_from_jam(double jf) {
+    if      (jf < 2.0)  return 0x01;   /* free traffic       */
+    else if (jf < 4.0)  return 0x02;   /* heavy traffic      */
+    else if (jf < 6.0)  return 0x03;   /* slow traffic       */
+    else if (jf < 8.0)  return 0x04;   /* queuing traffic    */
+    else if (jf < 10.0) return 0x05;   /* stationary traffic */
+    else                return 0x06;   /* no traffic flow    */
+}
+
 int tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
                       unsigned char version, const here_flow_t *fl) {
     if (e->error) return -1;
     if (!fl->has_tmc) return -1;
 
-    /* LevelOfService (tfp003) from HERE jamFactor 0..10 (Table 16). */
-    double jf = fl->jam_factor;
-    unsigned char los;
-    if      (jf < 2.0)  los = 0x01;   /* free traffic        */
-    else if (jf < 4.0)  los = 0x02;   /* heavy traffic       */
-    else if (jf < 6.0)  los = 0x03;   /* slow traffic        */
-    else if (jf < 8.0)  los = 0x04;   /* queuing traffic     */
-    else if (jf < 10.0) los = 0x05;   /* stationary traffic  */
-    else                los = 0x06;   /* no traffic flow     */
+    /* Section source: HERE sub-segments (multi) or the whole location (single). */
+    here_subseg_t whole;
+    const here_subseg_t *segs;
+    int nsec, multi;
 
-    /* averageSpeed (IntUnTi, km/h) from HERE speed (m/s). */
-    int spd_kmh = (int)(fl->speed * 3.6 + 0.5);
-    if (spd_kmh < 0)   spd_kmh = 0;
-    if (spd_kmh > 254) spd_kmh = 254;
-
-    /* freeFlowTravelTime (IntUnLoMB, seconds) = length / free-flow speed. */
-    unsigned int ff_tt = 0;
-    if (fl->free_flow > 0.1 && fl->length > 0.0) {
-        double s = fl->length / fl->free_flow + 0.5;
-        if (s < 0.0)     s = 0.0;
-        if (s > 65535.0) s = 65535.0;
-        ff_tt = (unsigned int)s;
+    if (fl->n_subseg >= 2) {
+        segs  = fl->subseg;
+        nsec  = fl->n_subseg;
+        if (nsec > HERE_MAX_SUBSEG) nsec = HERE_MAX_SUBSEG;
+        multi = 1;
+    } else {
+        whole.length     = fl->length;
+        whole.jam_factor = fl->jam_factor;
+        whole.speed      = fl->speed;
+        whole.free_flow  = fl->free_flow;
+        segs  = &whole;
+        nsec  = 1;
+        multi = 0;
     }
 
-    /* spatialOffset (TMC extents): one section spanning the whole location. */
+    /* TMC extent (clamped): single-section spatialOffset and comp02 LRC extent. */
     int ext = fl->tmc_extent;
     if (ext < 1)  ext = 1;
     if (ext > 30) ext = 30;
 
-    unsigned char ff_vb[5];
-    int ff_n = varint_to(ff_vb, ff_tt);
+    /* Build the concatenated FlowVectorSection bytes. */
+    unsigned char sec[HERE_MAX_SUBSEG * 10];
+    int sn = 0, i;
+    for (i = 0; i < nsec; i++) {
+        const here_subseg_t *s = &segs[i];
+        double jf = s->jam_factor;
+        unsigned char los;
+        int spd_kmh;
+        unsigned int ff_tt = 0, off;
+        unsigned char ff_vb[5];
+        int ff_n;
 
-    /* Size the nested components (all fit in one length byte). */
-    int sec_n = 1 + 1 + 1 + 1 + ff_n + 1;   /* off+statusSel+LOS+spd+ffTT+sectionSel */
-    int a7    = 1 + 1 + sec_n + 1;           /* timeOffset+count+section+trailer      */
-    int l7    = 1 + a7;                      /* attrlen byte + attrs                  */
-    int a6    = 6;                           /* startTime(4)+optSel+spatialRes        */
-    int l6    = 1 + a6 + (2 + l7);           /* attrlen byte + attrs + nested comp07  */
+        /* LevelOfService (tfp003) from HERE jamFactor 0..10 (Table 16). */
+        if      (jf < 2.0)  los = 0x01;   /* free traffic       */
+        else if (jf < 4.0)  los = 0x02;   /* heavy traffic      */
+        else if (jf < 6.0)  los = 0x03;   /* slow traffic       */
+        else if (jf < 8.0)  los = 0x04;   /* queuing traffic    */
+        else if (jf < 10.0) los = 0x05;   /* stationary traffic */
+        else                los = 0x06;   /* no traffic flow    */
 
-    unsigned char rest[64];
+        /* averageSpeed (IntUnTi, km/h) from HERE speed (m/s). */
+        spd_kmh = (int)(s->speed * 3.6 + 0.5);
+        if (spd_kmh < 0)   spd_kmh = 0;
+        if (spd_kmh > 254) spd_kmh = 254;
+
+        /* freeFlowTravelTime (IntUnLoMB, seconds) = length / free-flow speed. */
+        if (s->free_flow > 0.1 && s->length > 0.0) {
+            double v = s->length / s->free_flow + 0.5;
+            if (v < 0.0)     v = 0.0;
+            if (v > 65535.0) v = 65535.0;
+            ff_tt = (unsigned int)v;
+        }
+
+        /* spatialOffset (per-section span): 100 m units for multi-section from
+         * sub-segment length; TMC extents for the single-section case. */
+        if (multi) {
+            off = (unsigned int)(s->length / 100.0 + 0.5);
+            if (off < 1) off = 1;
+        } else {
+            off = (unsigned int)ext;
+        }
+
+        ff_n = varint_to(ff_vb, ff_tt);
+        sn += varint_to(sec + sn, off);          /* spatialOffset (varint)      */
+        sec[sn++] = 0x70;                        /* statusSel: LOS+avgSpeed+ffTT */
+        sec[sn++] = los;                         /* LevelOfService              */
+        sec[sn++] = (unsigned char)spd_kmh;      /* averageSpeed (km/h)         */
+        memcpy(sec + sn, ff_vb, (size_t)ff_n); sn += ff_n;  /* freeFlowTravelTime */
+        sec[sn++] = 0x00;                        /* sectionSelector: no optionals */
+    }
+
+    /* Size the nested components (varint lengths; single byte while < 128). */
+    unsigned char spatialRes = multi ? 0x03 : 0x00;   /* 0x03=100 m, 0x00=TMCLoc */
+    int a7 = 1 + 1 + sn + 1;                  /* timeOffset+count+sections+trailer  */
+    int l7 = varint_len((unsigned int)a7) + a7;
+    int a6 = 6;                              /* startTime(4)+optSel+spatialRes     */
+    int c7 = 1 + varint_len((unsigned int)l7) + l7;   /* comp07 tag+len+body       */
+    int l6 = varint_len((unsigned int)a6) + a6 + c7;
+
+    unsigned char rest[256];
     int r = 0;
 
     /* comp 06 FlowMatrix */
     rest[r++] = 0x06;
-    rest[r++] = (unsigned char)l6;
-    rest[r++] = (unsigned char)a6;
+    r += varint_to(rest + r, (unsigned int)l6);
+    r += varint_to(rest + r, (unsigned int)a6);
     rest[r++] = 0x00; rest[r++] = 0x00; rest[r++] = 0x00; rest[r++] = 0x00; /* startTime = 0 */
     rest[r++] = 0x00;                        /* optSelector: no duration       */
-    rest[r++] = 0x00;                        /* spatialResolution 000 = TMCLoc  */
+    rest[r++] = spatialRes;                  /* spatialResolution              */
     /* comp 07 FlowVector (nested inside FlowMatrix) */
     rest[r++] = 0x07;
-    rest[r++] = (unsigned char)l7;
-    rest[r++] = (unsigned char)a7;
+    r += varint_to(rest + r, (unsigned int)l7);
+    r += varint_to(rest + r, (unsigned int)a7);
     rest[r++] = 0x00;                        /* timeOffset = 0 (current status) */
-    rest[r++] = 0x01;                        /* count = 1 section               */
-    rest[r++] = (unsigned char)ext;          /* spatialOffset (TMC extents)     */
-    rest[r++] = 0x70;                        /* statusSel: LOS+avgSpeed+ffTT     */
-    rest[r++] = los;                         /* LevelOfService                  */
-    rest[r++] = (unsigned char)spd_kmh;      /* averageSpeed (km/h)             */
-    memcpy(rest + r, ff_vb, (size_t)ff_n); r += ff_n;  /* freeFlowTravelTime    */
-    rest[r++] = 0x00;                        /* sectionSelector: no optionals   */
+    rest[r++] = (unsigned char)nsec;         /* count = number of sections      */
+    memcpy(rest + r, sec, (size_t)sn); r += sn;
     rest[r++] = 0x00;                        /* trailer: no spatialResolutionVec */
 
     /* comp 02 TMC LocationReferencing (identical to the incident TMC path). */
@@ -655,6 +715,267 @@ int tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
                  fl->tmc_cc, fl->tmc_ltn, fl->tmc_loc, fl->tmc_dir);
         return emit_flow_message(e, hash_str(key), version, gen_time, rest, r);
     }
+}
+
+/* Longest chain of consecutive TMC segments emitted as one message. Native
+ * TomTom references road runs with TMC extents up to 30 (see the (count,extent)
+ * analysis in /memories/repo/tpeg-capture.md); we match that ceiling. The MMC
+ * stays single-byte because sections are LOS-run merged (few sections per run),
+ * not one-per-step. */
+#define TPEG_FLOW_CHAIN_MAX 30
+
+/* Longest consecutive-locationId run we actually MERGE into one extent>1
+ * message. Set to 1 to DISABLE chaining and emit every HERE segment as its own
+ * extent=1 point.
+ *
+ * On-device measurement (here_tmc_flow/log_0000+0001, 2026-07-19) proved our
+ * ID-arithmetic chains are counter-productive: extent>=2 messages resolve at
+ * only ~5% (11 ok / 198 fail) vs ~25% for extent=1 (17 ok / 51 fail), because
+ * consecutive HERE locationIds are NOT guaranteed to be adjacent in the car's
+ * TMC chain using step=1.  Analysis of all 8 target countries (CZ/AT/DE/PL/
+ * HU/SI/SK/HR) shows two valid step sizes: step=1 (motorways) and step=2
+ * (local roads).  We detect the step from the first pair and require every
+ * hop in the chain to use the SAME step, restoring chaining safely.
+ *
+ * Raised 8 -> 30 (2026-08-16): with the framing-overflow fixed the stream now
+ * reaches aId7 and resolves ~62%%, so longer native-style extents (median 10,
+ * max 30) are what makes roads visibly paint. HERE runs reach length 24. */
+#define TPEG_FLOW_CHAIN_EMIT_MAX 30
+
+/* Hard ceiling on the whole TPEG envelope. The TISA transport envelope length
+ * field (bytes[2:4]) is 16-bit, so an envelope of len16 = total-7 must stay
+ * below 0xFFFF; otherwise the head unit's TpegParser reads a truncated length,
+ * the message-count accounting breaks (CTECBinaryParser "countcurrent != ...")
+ * and TransportFrame::Parse fails the checksum -> the ENTIRE stream is dropped
+ * (proven on-device: a 112 977-byte stream parsed to FAILED, resolving 0 of its
+ * 885 unique locations; here_tmc_flow/log_0003, 2026-07-19). We stop adding flow
+ * once the projected size (already-emitted + both pending frame buffers) reaches
+ * this budget, well under 65535, leaving room for the final CRC/framing bytes. */
+#define TPEG_ENVELOPE_BUDGET 60000
+
+/* Cap on flow (TFP) messages so they fit in ONE SCID=2 component frame, exactly
+ * like the native TomTom stream (single SCID=2 frame, ~77 msgs). The per-frame
+ * messageCount is one byte, so a frame holds <=255; more than that forces a
+ * mid-stream flush that both emits a SECOND SCID=2 frame and interleaves it
+ * around the TEC frame (SNI, SCID2, SCID1, SCID2) instead of native's clean
+ * SNI, SCID1(TEC), SCID2(TFP) order. Same-location A/B capture (2026-08-16)
+ * showed our multi-frame/oversized flow is tagged aId0 (route-gated, dropped)
+ * while native single-frame flow is tagged aId7 (map-wide, renders green/red).
+ * 250 keeps one frame while covering far more than native's ~77. */
+#define TPEG_FLOW_MSG_MAX 250
+
+/* Emit ONE flow message for a chain of `nseg` consecutive TMC segments (each a
+ * 1-step HERE flow item), ordered from the chain primary outward. This mirrors
+ * native TomTom bulk flow, which references a whole road run by its primary TMC
+ * location plus an extent spanning many steps, and carries one FlowVectorSection
+ * per step (see /memories/repo/tpeg-capture.md).
+ *
+ * A single HERE segment (extent=1) usually fails on-device TMC resolution
+ * ("remaining extent = 1") because its lone neighbour is an intermediate point
+ * the car's table won't load standalone; a multi-step extent reaches a valid
+ * segment endpoint, exactly as native does (native extents span 1..30, ours were
+ * ~99% extent=1).
+ *
+ *   comp06 FlowMatrix : spatialResolution 0x00 (TMCLocations)
+ *   comp07 FlowVector : count = nseg sections; spatialOffset = nseg, nseg-1, ..1
+ *                       (first section offset == extent, decreasing, tiling the
+ *                        chain one TMC step per section)
+ *   comp02 LRC        : primary = segs[0], extent = nseg
+ */
+static int tpeg_enc_add_flow_chain(tpeg_enc_t *e, unsigned int gen_time,
+                                   unsigned char version,
+                                   const here_flow_t *const *segs, int nseg) {
+    if (e->error) return -1;
+    if (nseg < 1) return -1;
+    if (nseg > TPEG_FLOW_CHAIN_MAX) nseg = TPEG_FLOW_CHAIN_MAX;
+    const here_flow_t *p = segs[0];          /* chain primary                 */
+    if (!p->has_tmc) return -1;
+    int ext = nseg;
+
+    /* Build FlowVectorSections by merging consecutive same-LOS TMC steps into
+     * runs, exactly like native: one section per LevelOfService run spanning
+     * several steps (spatialOffset = remaining extent at the run's start), so a
+     * single message references a long road (extent up to nseg) with FEW
+     * sections. Native carries (count,extent) pairs like (1,30)/(5,25); ours
+     * used to force count==extent (one section per step), capping extent at the
+     * chain length and painting only tiny stubs. */
+    unsigned char sec[TPEG_FLOW_CHAIN_MAX * 8];
+    int sn = 0, i = 0, nsec = 0;
+    while (i < nseg) {
+        unsigned char los = los_from_jam(segs[i]->jam_factor);
+        double min_speed = segs[i]->speed;
+        double ff_sum = 0.0;
+        unsigned int off = (unsigned int)(nseg - i);   /* remaining extent here */
+        unsigned char ff_vb[5];
+        int ff_n, spd_kmh, j = i;
+
+        /* extend the run over consecutive steps sharing the same LOS */
+        while (j < nseg && los_from_jam(segs[j]->jam_factor) == los) {
+            if (segs[j]->speed < min_speed) min_speed = segs[j]->speed;
+            if (segs[j]->free_flow > 0.1 && segs[j]->length > 0.0)
+                ff_sum += segs[j]->length / segs[j]->free_flow;
+            j++;
+        }
+
+        spd_kmh = (int)(min_speed * 3.6 + 0.5);   /* slowest step = worst case  */
+        if (spd_kmh < 0)   spd_kmh = 0;
+        if (spd_kmh > 254) spd_kmh = 254;
+
+        unsigned int ff_tt = 0;
+        if (ff_sum > 0.0) {
+            double v = ff_sum + 0.5;
+            if (v > 65535.0) v = 65535.0;
+            ff_tt = (unsigned int)v;
+        }
+
+        ff_n = varint_to(ff_vb, ff_tt);
+        sn += varint_to(sec + sn, off);          /* spatialOffset (varint)      */
+        sec[sn++] = 0x70;                        /* statusSel: LOS+avgSpeed+ffTT */
+        sec[sn++] = los;                         /* LevelOfService              */
+        sec[sn++] = (unsigned char)spd_kmh;      /* averageSpeed (km/h)         */
+        memcpy(sec + sn, ff_vb, (size_t)ff_n); sn += ff_n;  /* freeFlowTravelTime */
+        sec[sn++] = 0x00;                        /* sectionSelector: no optionals */
+        nsec++;
+        i = j;
+    }
+
+    /* Size the nested components (varint lengths; single byte while < 128). */
+    int a7 = 1 + 1 + sn + 1;                  /* timeOffset+count+sections+trailer  */
+    int l7 = varint_len((unsigned int)a7) + a7;
+    int a6 = 6;                              /* startTime(4)+optSel+spatialRes     */
+    int c7 = 1 + varint_len((unsigned int)l7) + l7;   /* comp07 tag+len+body       */
+    int l6 = varint_len((unsigned int)a6) + a6 + c7;
+
+    unsigned char rest[256];
+    int r = 0;
+
+    /* comp 06 FlowMatrix (spatialResolution 0x00 = TMCLocations) */
+    rest[r++] = 0x06;
+    r += varint_to(rest + r, (unsigned int)l6);
+    r += varint_to(rest + r, (unsigned int)a6);
+    rest[r++] = 0x00; rest[r++] = 0x00; rest[r++] = 0x00; rest[r++] = 0x00; /* startTime = 0 */
+    rest[r++] = 0x00;                        /* optSelector: no duration       */
+    rest[r++] = 0x00;                        /* spatialResolution = TMCLocations */
+    /* comp 07 FlowVector */
+    rest[r++] = 0x07;
+    r += varint_to(rest + r, (unsigned int)l7);
+    r += varint_to(rest + r, (unsigned int)a7);
+    rest[r++] = 0x00;                        /* timeOffset = 0 (current status) */
+    rest[r++] = (unsigned char)nsec;         /* count = number of LOS-run sections */
+    memcpy(rest + r, sec, (size_t)sn); r += sn;
+    rest[r++] = 0x00;                        /* trailer: no spatialResolutionVec */
+
+    /* comp 02 TMC LocationReferencing: chain primary + multi-step extent. */
+    {
+        unsigned char loc_hi = (unsigned char)((p->tmc_loc >> 8) & 0xff);
+        unsigned char loc_lo = (unsigned char)(p->tmc_loc & 0xff);
+        unsigned char cc     = (unsigned char)(p->tmc_cc & 0xff);
+        unsigned char ltn    = (unsigned char)(p->tmc_ltn & 0xff);
+        unsigned char flags  = (unsigned char)(0x10 | (p->tmc_dir ? 0x40 : 0));
+        rest[r++] = 0x02; rest[r++] = 0x0a; rest[r++] = 0x00; rest[r++] = 0x02;
+        rest[r++] = 0x07; rest[r++] = 0x06; rest[r++] = loc_hi; rest[r++] = loc_lo;
+        rest[r++] = cc; rest[r++] = ltn; rest[r++] = flags; rest[r++] = (unsigned char)ext;
+    }
+
+    {
+        char key[40];
+        snprintf(key, sizeof key, "F%d,%d,%d,%d",
+                 p->tmc_cc, p->tmc_ltn, p->tmc_loc, p->tmc_dir);
+        return emit_flow_message(e, hash_str(key), version, gen_time, rest, r);
+    }
+}
+
+/* qsort comparator: group TMC flow segments by country/table/direction, then
+ * ascending locationId, so consecutive-locationId runs land adjacent. */
+static int flow_chain_cmp(const void *pa, const void *pb) {
+    const here_flow_t *a = *(const here_flow_t *const *)pa;
+    const here_flow_t *b = *(const here_flow_t *const *)pb;
+    if (a->tmc_cc  != b->tmc_cc)  return a->tmc_cc  - b->tmc_cc;
+    if (a->tmc_ltn != b->tmc_ltn) return a->tmc_ltn - b->tmc_ltn;
+    if (a->tmc_dir != b->tmc_dir) return a->tmc_dir - b->tmc_dir;
+    return a->tmc_loc - b->tmc_loc;
+}
+
+/* Merge the parsed HERE flow segments into native-style multi-step TMC chains
+ * and emit one FlowVector message per chain. HERE returns granular single-step
+ * (extent=1) TMC references that mostly fail on-device resolution; consecutive
+ * same-direction locationIds are the same road, so we concatenate them into a
+ * primary + extent reference (mirroring native TomTom's 1..30 extents).
+ *
+ * tmc_dir 0 chains walk up from the lowest locationId; tmc_dir 1 chains walk
+ * down from the highest (tmc_dir is the car-side direction bit, already inverted
+ * from HERE's queuingDirection in here_source.c). Either way the same physical
+ * stretch is covered, referenced from the matching end. Runs longer than
+ * TPEG_FLOW_CHAIN_MAX are split into consecutive sub-chains. Returns the number
+ * of messages written. */
+int tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
+                       unsigned char version, const here_flow_t *flows, int n) {
+    if (e->error || n <= 0) return 0;
+
+    const here_flow_t **ord =
+        (const here_flow_t **)malloc(sizeof(*ord) * (size_t)n);
+    if (!ord) return 0;
+
+    int m = 0, i;
+    for (i = 0; i < n; i++) if (flows[i].has_tmc) ord[m++] = &flows[i];
+    if (m == 0) { free(ord); return 0; }
+    qsort(ord, (size_t)m, sizeof(*ord), flow_chain_cmp);
+
+    int written = 0;
+    i = 0;
+    while (i < m) {
+        /* Keep all flow in ONE SCID=2 frame (native emits a single flow frame);
+         * a mid-stream flush would add a second frame and break native's
+         * SNI/TEC/TFP ordering. See TPEG_FLOW_MSG_MAX. */
+        if (written >= TPEG_FLOW_MSG_MAX)
+            break;
+
+        /* Stop before the envelope's 16-bit length field can overflow. The
+         * projected size is what is already flushed (e->len) plus both pending
+         * frame buffers (incidents + flow not yet wrapped). Once we hit the
+         * budget, drop the remaining flow rather than emit a stream the head
+         * unit will reject wholesale. */
+        if ((size_t)e->len + e->mlen + e->flen >= TPEG_ENVELOPE_BUDGET)
+            break;
+
+        /* Extend a maximal run of consecutive locationIds within one group,
+         * capped so each message stays under the size limits.
+         * TMC tables use either step=1 (motorways) or step=2 (local roads).
+         * Detect the step from the first pair and require consistency so we
+         * never accidentally join codes from two different roads. */
+        int run_step = 1;
+        if (i + 1 < m &&
+            ord[i+1]->tmc_cc  == ord[i]->tmc_cc  &&
+            ord[i+1]->tmc_ltn == ord[i]->tmc_ltn &&
+            ord[i+1]->tmc_dir == ord[i]->tmc_dir) {
+            int d = ord[i+1]->tmc_loc - ord[i]->tmc_loc;
+            if (d == 1 || d == 2) run_step = d;
+        }
+        int j = i + 1;
+        while (j < m &&
+               ord[j]->tmc_cc  == ord[i]->tmc_cc  &&
+               ord[j]->tmc_ltn == ord[i]->tmc_ltn &&
+               ord[j]->tmc_dir == ord[i]->tmc_dir &&
+               ord[j]->tmc_loc == ord[j - 1]->tmc_loc + run_step &&
+               (j - i) < TPEG_FLOW_CHAIN_EMIT_MAX)
+            j++;
+        int run = j - i;
+
+        /* Order the run from the chain primary outward. */
+        const here_flow_t *chain[TPEG_FLOW_CHAIN_MAX];
+        int k;
+        if (ord[i]->tmc_dir == 0) {                 /* dir 0 : primary = lowest  */
+            for (k = 0; k < run; k++) chain[k] = ord[i + k];
+        } else {                                    /* dir 1 : primary = highest */
+            for (k = 0; k < run; k++) chain[k] = ord[i + run - 1 - k];
+        }
+        if (tpeg_enc_add_flow_chain(e, gen_time, version, chain, run) == 0)
+            written++;
+        i = j;
+    }
+
+    free(ord);
+    return written;
 }
 
 /* TPEG header CRC-16 (TISA "CCITT" variant), per the TPEG2 evaluation-kit

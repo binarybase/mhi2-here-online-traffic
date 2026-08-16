@@ -181,8 +181,13 @@ int here_parse_flow(const char *json, size_t len,
                         f->tmc_loc = (int)tok_double(json, &t[v]);
                     if ((v = obj_get(json, t, tmcv, "extent")) >= 0)
                         f->tmc_extent = (int)tok_double(json, &t[v]);
+                    /* HERE queuingDirection is INVERTED vs the car's TMC table
+                     * direction bit: byte-level diff against native TomTom shows
+                     * HERE "+" resolves as the car's negative direction and vice
+                     * versa (13/13 single-direction failures were the opposite
+                     * of native's rendered direction). Map "+"->1, "-"->0. */
                     if ((v = obj_get(json, t, tmcv, "queuingDirection")) >= 0)
-                        f->tmc_dir = (json[t[v].start] == '-') ? 1 : 0;
+                        f->tmc_dir = (json[t[v].start] == '-') ? 0 : 1;
                     if (f->tmc_ltn > 0 && f->tmc_loc > 0)
                         f->has_tmc = 1;
                 }
@@ -192,6 +197,27 @@ int here_parse_flow(const char *json, size_t len,
                 if ((v = obj_get(json, t, cf, "jamFactor")) >= 0) f->jam_factor = tok_double(json, &t[v]);
                 if ((v = obj_get(json, t, cf, "speed"))     >= 0) f->speed      = tok_double(json, &t[v]);
                 if ((v = obj_get(json, t, cf, "freeFlow"))  >= 0) f->free_flow  = tok_double(json, &t[v]);
+                /* currentFlow.subSegments[]: metric sub-ranges with per-range
+                 * flow. Kept for native-style multi-section flow encoding. */
+                {
+                    int ss = obj_get(json, t, cf, "subSegments");
+                    if (ss >= 0 && t[ss].type == JSMN_ARRAY) {
+                        int sn = t[ss].size, si, sj = ss + 1, w = 0;
+                        for (si = 0; si < sn && w < HERE_MAX_SUBSEG;
+                             si++, sj = tok_skip(t, sj)) {
+                            here_subseg_t *g = &f->subseg[w];
+                            int u;
+                            if (t[sj].type != JSMN_OBJECT) continue;
+                            g->length = g->jam_factor = g->speed = g->free_flow = 0.0;
+                            if ((u = obj_get(json, t, sj, "length"))    >= 0) g->length     = tok_double(json, &t[u]);
+                            if ((u = obj_get(json, t, sj, "jamFactor")) >= 0) g->jam_factor = tok_double(json, &t[u]);
+                            if ((u = obj_get(json, t, sj, "speed"))     >= 0) g->speed      = tok_double(json, &t[u]);
+                            if ((u = obj_get(json, t, sj, "freeFlow"))  >= 0) g->free_flow  = tok_double(json, &t[u]);
+                            w++;
+                        }
+                        f->n_subseg = w;
+                    }
+                }
             }
         }
         if (count) (*count)++;
@@ -244,8 +270,9 @@ int here_parse_incidents(const char *json, size_t len,
                         inc->tmc_loc = (int)tok_double(json, &t[v]);
                     if ((v = obj_get(json, t, tmcv, "extent")) >= 0)
                         inc->tmc_extent = (int)tok_double(json, &t[v]);
+                    /* Same direction inversion as flow (see above): "+"->1, "-"->0. */
                     if ((v = obj_get(json, t, tmcv, "queuingDirection")) >= 0)
-                        inc->tmc_dir = (json[t[v].start] == '-') ? 1 : 0;
+                        inc->tmc_dir = (json[t[v].start] == '-') ? 0 : 1;
                     /* A usable reference needs a location table + code. */
                     if (inc->tmc_ltn > 0 && inc->tmc_loc > 0)
                         inc->has_tmc = 1;

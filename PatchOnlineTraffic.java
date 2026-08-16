@@ -15,23 +15,29 @@
  *               for the session-init request lets Audi mint a valid session
  *               object (duration + update frequencies), which we then reuse.
  *
- *  (2) Data-source redirect + null key  [applied when redirectUrl != "none"]
+ *  (2) Data-source runtime TOGGLE  [applied when redirectUrl != "none"]
  *      class  : de.eso.mib.online.onlinetraffic.impl.TrafficSession
- *      ctor   : TrafficSession(long duration, java.io.Reader r)
- *      why    : after Audi's session XML is parsed, overwrite the "url"
- *               session property so all subsequent getMessages requests go to
- *               OUR on-device backend (native C++ HTTP server on uap0), and
- *               null the AES key so the wire protocol degrades to plain
- *               gzip(XML) request / raw TPEG response (no AES, no length
- *               prefix). getURL() still appends "?tid=N"; getEncryptionKey()
- *               now returns null, so both request-writer and response-reader
- *               take their no-crypto paths.
+ *      methods: getURL() and getEncryptionKey()  (bodies rewritten)
+ *      why    : the patch is installed PERMANENTLY. Which backend is used is
+ *               decided per request at read-time by the presence of a flag
+ *               file (default /mnt/persist/traffic_backend_here):
+ *                 - flag PRESENT  -> getURL() returns OUR on-device backend
+ *                   (native C++ HTTP server on uap0) and getEncryptionKey()
+ *                   returns null, so request-writer/response-reader take the
+ *                   plaintext gzip(XML)/raw-TPEG path.
+ *                 - flag ABSENT   -> getURL() returns the real TomTom url from
+ *                   the session properties and getEncryptionKey() returns the
+ *                   real aeskey, i.e. behaviour is identical to the stock jar.
+ *               The constructor is left untouched (real url + key stay stored),
+ *               so toggling needs no JVM restart: touch/rm the flag file.
  *
  * All other bytes of the jar are left byte-for-byte identical.
  *
  * Usage:
  *   java -cp javassist.jar:. PatchOnlineTraffic <in.jar> <out.jar> \
- *        [remapTo=SI] [redirectUrl=http://10.173.189.1:8099/traffic|none]
+ *        [remapTo=SI] [redirectUrl=http://10.173.189.1:8099/traffic|none] \
+ *        [captureLatLon=lat,lon|none] [deps=...|none] \
+ *        [flagFile=/mnt/persist/traffic_backend_here]
  */
 import javassist.ClassPool;
 import javassist.CtClass;
@@ -63,11 +69,16 @@ public class PatchOnlineTraffic {
 
     private static final String DEFAULT_REDIRECT = "http://10.173.189.1:8099/traffic";
 
+    // Presence of this file (on the JVM host) selects the HERE backend at
+    // request time; absence keeps the stock TomTom path. No JVM restart needed.
+    private static final String DEFAULT_FLAG_FILE = "/mnt/persist/traffic_backend_here";
+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             System.err.println("Usage: PatchOnlineTraffic <in.jar> <out.jar> "
                     + "[remapTo=SI] [redirectUrl=" + DEFAULT_REDIRECT + "|none] "
-                    + "[captureLatLon=lat,lon|none] [deps=jar1" + java.io.File.pathSeparator + "dir2|none]");
+                    + "[captureLatLon=lat,lon|none] [deps=jar1" + java.io.File.pathSeparator + "dir2|none] "
+                    + "[flagFile=" + DEFAULT_FLAG_FILE + "]");
             System.exit(2);
         }
         String inJar = args[0];
@@ -76,6 +87,11 @@ public class PatchOnlineTraffic {
         String redirectUrl = (args.length > 3 && args[3].length() > 0) ? args[3] : DEFAULT_REDIRECT;
         String captureLatLon = (args.length > 4 && args[4].length() > 0) ? args[4] : "none";
         String deps = (args.length > 5 && args[5].length() > 0 && !"none".equalsIgnoreCase(args[5])) ? args[5] : "";
+        String flagFile = (args.length > 6 && args[6].length() > 0) ? args[6] : DEFAULT_FLAG_FILE;
+        if (flagFile.indexOf('"') >= 0 || flagFile.indexOf('\\') >= 0) {
+            System.err.println("flagFile contains illegal characters: " + flagFile);
+            System.exit(2);
+        }
 
         if (remapTo.length() != 2) {
             System.err.println("remapTo must be a 2-letter ISO country code, got: " + remapTo);
@@ -128,7 +144,10 @@ public class PatchOnlineTraffic {
             System.out.println("OK (1): HR->" + remapTo + " remap injected into " + EVENT_METHOD);
         }
 
-        // ── Patch (2): redirect data URL + null AES key in TrafficSession ──────
+        // ── Patch (2): runtime TOGGLE — override getURL + getEncryptionKey ────
+        // The patch is permanent; the backend is chosen per request by the
+        // presence of `flagFile`. Flag absent => stock TomTom behaviour
+        // (real url + real key). Flag present => our backend + null key.
         if (doRedirect) {
             if (redirectUrl.indexOf('"') >= 0 || redirectUrl.indexOf('\\') >= 0) {
                 System.err.println("redirectUrl contains illegal characters: " + redirectUrl);
@@ -136,18 +155,29 @@ public class PatchOnlineTraffic {
             }
             CtClass cc = cp.get(SESSION_CLASS);
             if (cc.isFrozen()) cc.defrost();
-            // Constructor: TrafficSession(long duration, java.io.Reader r)
-            CtConstructor ctor = cc.getDeclaredConstructor(new CtClass[]{
-                    CtClass.longType, cp.get("java.io.Reader") });
-            // Runs only on normal (successful) construction. Overwrite the "url"
-            // session property so getURL() targets our backend, and null the key
-            // so getEncryptionKey() returns null (plaintext wire protocol).
-            String snippet =
-                    "{ this.sessionProperties.put(\"url\", \"" + redirectUrl + "\");"
-                  + "  this.aeskey = null; }";
-            ctor.insertAfter(snippet);
+
+            // getURL(): flag present -> our backend; else the stored TomTom url.
+            // Preserve the original "?tid="/"&tid=" suffix logic either way.
+            CtMethod gurl = cc.getDeclaredMethod("getURL");
+            gurl.setBody(
+                    "{ String __u;"
+                  + "  if (new java.io.File(\"" + flagFile + "\").exists()) {"
+                  + "      __u = \"" + redirectUrl + "\"; }"
+                  + "  else { __u = this.sessionProperties.getProperty(\"url\"); }"
+                  + "  if (__u.indexOf(\"?\") == -1) {"
+                  + "      __u = __u + \"?tid=\" + String.valueOf(this.getTid()); }"
+                  + "  else { __u = __u + \"&tid=\" + String.valueOf(this.getTid()); }"
+                  + "  return new java.net.URL(__u); }");
+
+            // getEncryptionKey(): flag present -> null (plaintext); else real key.
+            CtMethod gkey = cc.getDeclaredMethod("getEncryptionKey");
+            gkey.setBody(
+                    "{ if (new java.io.File(\"" + flagFile + "\").exists()) { return null; }"
+                  + "  return this.aeskey; }");
+
             patched.put(SESSION_CLASS.replace('.', '/') + ".class", cc.toBytecode());
-            System.out.println("OK (2): redirect url=" + redirectUrl + " + null key injected into TrafficSession ctor");
+            System.out.println("OK (2): runtime toggle installed in TrafficSession "
+                    + "(flag=" + flagFile + " -> url=" + redirectUrl + " + null key)");
         } else {
             System.out.println("SKIP (2): redirect disabled (redirectUrl=none)");
         }

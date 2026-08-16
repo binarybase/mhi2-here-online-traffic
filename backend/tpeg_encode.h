@@ -83,6 +83,18 @@ int  tpeg_enc_add_incident(tpeg_enc_t *e, unsigned int gen_time,
 int  tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
                        unsigned char version, const here_flow_t *fl);
 
+/*
+ * Merge the parsed HERE flow segments into native-style multi-step TMC chains
+ * and append one TFP FlowVector message per chain. HERE returns granular
+ * single-step (extent=1) TMC references that mostly fail on-device resolution;
+ * consecutive same-direction locationIds are the same road, so they are
+ * concatenated into a primary + extent reference (mirroring native TomTom's
+ * 1..30 extents) with one FlowVectorSection per step. Prefer this over calling
+ * tpeg_enc_add_flow per item. Returns the number of messages written.
+ */
+int  tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
+                        unsigned char version, const here_flow_t *flows, int n);
+
 /* Backpatch the envelope length. Call once, after all messages. */
 void tpeg_enc_finish(tpeg_enc_t *e);
 

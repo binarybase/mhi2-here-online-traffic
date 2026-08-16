@@ -24,6 +24,17 @@ extern "C" {
 #define HERE_TYPE_MAX   48
 #define HERE_CRIT_MAX   16
 #define HERE_TIME_MAX   32
+#define HERE_MAX_SUBSEG 12   /* cap so multi-section msg component lengths stay <128B */
+
+/* One HERE currentFlow.subSegments[] entry — a metric sub-range of the TMC
+ * location with its own flow status. Emitted as one TPEG FlowVectorSection so
+ * our stream mirrors native TomTom's multi-section flow (see tpeg_enc_add_flow). */
+typedef struct {
+    double length;            /* sub-segment length (m)                     */
+    double jam_factor;        /* 0.0 (free) .. 10.0 (blocked)               */
+    double speed;             /* current speed (m/s)                        */
+    double free_flow;         /* free-flow speed (m/s)                      */
+} here_subseg_t;
 
 /* One real-time flow segment. */
 typedef struct {
@@ -33,6 +44,11 @@ typedef struct {
     double speed;             /* current speed (m/s)                        */
     double free_flow;         /* free-flow speed (m/s)                      */
     int    has_olr;           /* 1 if olr was present                       */
+    /* currentFlow.subSegments[]: metric breakdown of the flow along the TMC
+     * location. When >=2 present, the encoder emits a native-style multi-section
+     * FlowVector (one section per sub-segment) instead of a single section.     */
+    int          n_subseg;
+    here_subseg_t subseg[HERE_MAX_SUBSEG];
     /* TMC location reference (location.tmc). The head unit resolves TMC
      * location codes natively but cannot decode OpenLR, so only TMC-referenced
      * flow renders. Populated only when HERE returns a tmc object.            */
@@ -40,7 +56,8 @@ typedef struct {
     int    tmc_cc;            /* ebuCountryCode, hex digit -> int (CZ = 2)   */
     int    tmc_ltn;           /* tableId / location table number (CZ = 25)   */
     int    tmc_loc;           /* locationId (16-bit TMC location code)       */
-    int    tmc_dir;           /* queuingDirection: 0 = "+", 1 = "-"          */
+    int    tmc_dir;           /* TMC direction bit, INVERTED from HERE's
+                                queuingDirection: "+" -> 1, "-" -> 0          */
     int    tmc_extent;        /* extent (number of TMC steps)               */
 } here_flow_t;
 
@@ -63,7 +80,8 @@ typedef struct {
     int  tmc_cc;                  /* ebuCountryCode, hex digit -> int (CZ = 2) */
     int  tmc_ltn;                 /* tableId / location table number (CZ = 25) */
     int  tmc_loc;                 /* locationId (16-bit TMC location code)     */
-    int  tmc_dir;                 /* queuingDirection: 0 = "+", 1 = "-"        */
+    int  tmc_dir;                 /* TMC direction bit, INVERTED from HERE's
+                                     queuingDirection: "+" -> 1, "-" -> 0      */
     int  tmc_extent;             /* extent (number of TMC steps)              */
 } here_incident_t;
 
