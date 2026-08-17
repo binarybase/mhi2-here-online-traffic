@@ -338,6 +338,24 @@ void tpeg_enc_begin(tpeg_enc_t *e) {
 static void flush_tec_frame(tpeg_enc_t *e);
 static void flush_tfp_frame(tpeg_enc_t *e);
 
+/* Per-frame flow message cap: the component-frame messageCount is one byte, so
+ * a single SCID=2 frame holds at most 255 messages. 250 leaves headroom. When
+ * more flow than this is emitted, emit_flow_message flushes the current frame
+ * and starts a new SCID=2 frame; tpeg_enc_add_flows flushes the TEC frame first
+ * so the ordering stays SNI, SCID1(TEC), SCID2(TFP)+ (never TFP before TEC). */
+#define TPEG_FLOW_FRAME_MSGS 250
+
+/* Number of SCID=2 flow frames we allow per stream. Native TomTom emits ONE
+ * (~77 msgs). We EXPERIMENT with 2 to roughly double the flow budget now that
+ * flow renders (green roads) — the historic aId0 dropping came from 9 frames on
+ * an oversized, length-overflowed transport envelope, both since fixed; two
+ * well-formed frames under the 60 KB budget stay well within the 16-bit
+ * transport length. Set back to 1 to restore native single-frame behaviour. */
+#define TPEG_FLOW_FRAMES 2
+
+/* Total flow (TFP) messages across all frames. */
+#define TPEG_FLOW_MSG_MAX (TPEG_FLOW_FRAME_MSGS * TPEG_FLOW_FRAMES)
+
 static int emit_message(tpeg_enc_t *e, unsigned int id, unsigned char version,
                         unsigned int gen_time, const unsigned char *rest, int r) {
     int identlen = varint_len(id) + 6;   /* varint id + ver + expiry(4) + flag */
@@ -528,8 +546,9 @@ static int emit_flow_message(tpeg_enc_t *e, unsigned int id, unsigned char versi
     int mmc_len = 4 + identlen + r;      /* 00 01 + L + L-1 + ident + rest    */
     if (mmc_len > 0xff) return -1;
 
-    /* Keep each TFP frame's messageCount within one byte (<=250). */
-    if (e->fcount >= 250) flush_tfp_frame(e);
+    /* Keep each TFP frame's messageCount within one byte; overflow starts a new
+     * SCID=2 frame (see TPEG_FLOW_FRAMES). */
+    if (e->fcount >= TPEG_FLOW_FRAME_MSGS) flush_tfp_frame(e);
 
     fput1(e, 0x00);                      /* TFP message CompID (0)            */
     fput1(e, (unsigned char)mmc_len);    /* message CompLen                   */
@@ -747,10 +766,16 @@ int tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
  * (local roads).  We detect the step from the first pair and require every
  * hop in the chain to use the SAME step, restoring chaining safely.
  *
- * Raised 8 -> 30 (2026-08-16): with the framing-overflow fixed the stream now
- * reaches aId7 and resolves ~62%%, so longer native-style extents (median 10,
- * max 30) are what makes roads visibly paint. HERE runs reach length 24. */
-#define TPEG_FLOW_CHAIN_EMIT_MAX 30
+ * On-road measurement 2026-08-17 (esotrace 264/log_0009, car moving): of 604
+ * flow resolution attempts, extent=1 refs failed only 13 times while chained
+ * extent>=2 refs failed 354 times (~30 resolved total, ~5%). i.e. our guessed
+ * multi-step extents almost never match the car's TMC topology, whereas single
+ * points resolve. Set to 1 to emit every HERE segment as its own extent=1 ref
+ * (no chaining) — the highest-leverage lever for LOCAL coverage: it trades
+ * physical reach (which near-car already has, feed is dense <20km) for a far
+ * higher resolve rate. Raise it again only with car-verified per-location
+ * extents (see tools/harvest_codes.py). */
+#define TPEG_FLOW_CHAIN_EMIT_MAX 1
 
 /* Max gap (in TMC steps) we bridge when chaining. HERE omits locations where
  * flow is unremarkable, leaving 1-step holes in an otherwise contiguous road;
@@ -770,16 +795,9 @@ int tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
  * this budget, well under 65535, leaving room for the final CRC/framing bytes. */
 #define TPEG_ENVELOPE_BUDGET 60000
 
-/* Cap on flow (TFP) messages so they fit in ONE SCID=2 component frame, exactly
- * like the native TomTom stream (single SCID=2 frame, ~77 msgs). The per-frame
- * messageCount is one byte, so a frame holds <=255; more than that forces a
- * mid-stream flush that both emits a SECOND SCID=2 frame and interleaves it
- * around the TEC frame (SNI, SCID2, SCID1, SCID2) instead of native's clean
- * SNI, SCID1(TEC), SCID2(TFP) order. Same-location A/B capture (2026-08-16)
- * showed our multi-frame/oversized flow is tagged aId0 (route-gated, dropped)
- * while native single-frame flow is tagged aId7 (map-wide, renders green/red).
- * 250 keeps one frame while covering far more than native's ~77. */
-#define TPEG_FLOW_MSG_MAX 250
+/* Flow message budget (TPEG_FLOW_MSG_MAX) and per-frame split are defined near
+ * the top of this file, before emit_flow_message. Native emits ONE SCID=2 frame
+ * (~77 msgs); we currently allow TPEG_FLOW_FRAMES frames (experiment). */
 
 /* Emit ONE flow message for a chain of `nseg` consecutive TMC segments (each a
  * 1-step HERE flow item), ordered from the chain primary outward. This mirrors
@@ -965,6 +983,12 @@ int tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
                        double ref_lat, double ref_lon) {
     if (e->error || n <= 0) return 0;
 
+    /* Flush any pending TEC (incident) messages as their SCID=1 frame BEFORE
+     * emitting flow, so when flow spans more than one SCID=2 frame
+     * (TPEG_FLOW_FRAMES > 1) the frame order stays native-clean:
+     * SNI, SCID1(TEC), SCID2(TFP), SCID2(TFP) — never a TFP frame before TEC. */
+    flush_tec_frame(e);
+
     const here_flow_t **ord =
         (const here_flow_t **)malloc(sizeof(*ord) * (size_t)n);
     if (!ord) return 0;
@@ -1032,15 +1056,15 @@ int tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
         i = j;
     }
 
-    /* Pass 2: emit nearest chains first, within the single-frame message count
-     * and the envelope's 16-bit length budget, so the visible map is covered. */
+    /* Pass 2: emit nearest chains first, within the flow message budget and the
+     * envelope's 16-bit length budget, so the visible map is covered. */
     qsort(runs, (size_t)nruns, sizeof(*runs), flow_run_cmp);
 
     int written = 0, ri;
     for (ri = 0; ri < nruns; ri++) {
-        /* Keep all flow in ONE SCID=2 frame (native emits a single flow frame);
-         * a second frame would break native's SNI/TEC/TFP ordering and tag the
-         * flow aId0 (route-gated, dropped) instead of aId7. See TPEG_FLOW_MSG_MAX. */
+        /* Cap total flow at TPEG_FLOW_MSG_MAX (TPEG_FLOW_FRAMES SCID=2 frames of
+         * up to TPEG_FLOW_FRAME_MSGS each; emit_flow_message splits the frames).
+         * The TEC frame was flushed above so all flow frames follow it. */
         if (written >= TPEG_FLOW_MSG_MAX)
             break;
 
