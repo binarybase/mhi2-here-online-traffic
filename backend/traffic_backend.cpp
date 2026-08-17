@@ -46,6 +46,7 @@
 #include <arpa/inet.h>
 
 #include <zlib.h>
+#include <cmath>
 
 #include "here_source.h"
 #include "here_fetch.h"
@@ -89,7 +90,7 @@ static const int  HERE_MAX_INCIDENTS = 256;
 // 16-bit length limit (TPEG_ENVELOPE_BUDGET) — a larger stream is rejected
 // wholesale by the head unit's parser (checksum failure), so this is just the
 // candidate pool the encoder fills that budget from.
-static const int  HERE_MAX_FLOW = 1024;
+static const int  HERE_MAX_FLOW = 4096;
 
 static FILE* g_log = NULL;
 static std::string g_here_key;   // HERE apiKey (loaded at startup; never logged)
@@ -249,6 +250,24 @@ static bool parse_position(const std::string& xml, double& lat, double& lon) {
     return true;
 }
 
+// Order incidents nearest-to-car first so the head unit lists the closest
+// incidents at the top, like native TomTom (which sorts by distance). qsort
+// has no user-data argument, so the reference position is passed via file-scope
+// statics (the server is single-threaded, one request at a time).
+static double g_inc_ref_lat = 0.0, g_inc_ref_lon = 0.0, g_inc_coslat = 1.0;
+static int inc_dist_cmp(const void *pa, const void *pb) {
+    const here_incident_t *a = (const here_incident_t *)pa;
+    const here_incident_t *b = (const here_incident_t *)pb;
+    if (a->has_coord != b->has_coord) return a->has_coord ? -1 : 1;
+    if (!a->has_coord) return 0;
+    double adx = (a->lon - g_inc_ref_lon) * g_inc_coslat, ady = a->lat - g_inc_ref_lat;
+    double bdx = (b->lon - g_inc_ref_lon) * g_inc_coslat, bdy = b->lat - g_inc_ref_lat;
+    double da = adx * adx + ady * ady, db = bdx * bdx + bdy * bdy;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
 // Fetch HERE incidents around (lat,lon), encode them into a TPEG stream.
 // Returns true and fills `out` on success; false => caller falls back to empty.
 static bool build_tpeg_response(double lat, double lon, std::string& out) {
@@ -290,6 +309,13 @@ static bool build_tpeg_response(double lat, double lon, std::string& out) {
 
     int n = count < HERE_MAX_INCIDENTS ? count : HERE_MAX_INCIDENTS;
 
+    // Sort incidents nearest-first so the head unit's message list matches
+    // native's distance ordering (the list follows the stream order).
+    g_inc_ref_lat = lat;
+    g_inc_ref_lon = lon;
+    g_inc_coslat  = cos(lat * (3.14159265358979323846 / 180.0));
+    qsort(incs, (size_t) n, sizeof(here_incident_t), inc_dist_cmp);
+
     tpeg_enc_t enc;
     if (tpeg_enc_init(&enc)) { free(incs); return false; }
     tpeg_enc_begin(&enc);
@@ -329,9 +355,10 @@ static bool build_tpeg_response(double lat, double lon, std::string& out) {
                 if (here_parse_flow(fjson.data(), fjson.size(),
                                     flows, HERE_MAX_FLOW, &fcount) == 0) {
                     int fn = fcount < HERE_MAX_FLOW ? fcount : HERE_MAX_FLOW;
-                    /* Emit each HERE segment as its own extent=1 TMC point
-                     * (chaining is disabled in the encoder). */
-                    flow_written += tpeg_enc_add_flows(&enc, gen, 1, flows, fn);
+                    /* Emit HERE segments as native-style TMC chains, nearest to
+                     * the car first so the visible map is always covered. */
+                    flow_written += tpeg_enc_add_flows(&enc, gen, 1, flows, fn,
+                                                       lat, lon);
                 }
                 free(flows);
             }

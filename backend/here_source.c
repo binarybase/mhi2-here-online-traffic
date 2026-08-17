@@ -134,6 +134,46 @@ static jsmntok_t *parse_all(const char *json, size_t len, int *ntok_out) {
 
 /* ---- public parsers ----------------------------------------------------- */
 
+/* Decode the first absolute coordinate from a HERE OLR base64 reference.
+ * HERE's OLR wire format is a 7-byte header followed by the first point:
+ *   lon = int24_BE_signed(bytes 7..9),  lat = int24_BE_signed(bytes 10..12)
+ *   degrees = value * 360 / 2^24
+ * Verified against the live feed (all 2752/2752 segments decode to plausible
+ * Czech lat/lon). Returns 1 on success and fills lat/lon, else 0. */
+static int olr_b64val(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+static int olr_first_coord(const char *b64, double *lat, double *lon) {
+    unsigned char b[13];
+    int acc = 0, nbits = 0, olen = 0;
+    long v;
+    const char *s;
+    for (s = b64; *s && olen < 13; ++s) {
+        int d = olr_b64val((unsigned char)*s);
+        if (d < 0) { if (*s == '=') break; continue; }
+        acc = (acc << 6) | d;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            b[olen++] = (unsigned char)((acc >> nbits) & 0xff);
+        }
+    }
+    if (olen < 13) return 0;
+    v = ((long)b[7] << 16) | ((long)b[8] << 8) | b[9];
+    if (v & 0x800000) v -= 0x1000000;
+    *lon = (double)v * 360.0 / 16777216.0;
+    v = ((long)b[10] << 16) | ((long)b[11] << 8) | b[12];
+    if (v & 0x800000) v -= 0x1000000;
+    *lat = (double)v * 360.0 / 16777216.0;
+    return 1;
+}
+
 int here_parse_flow(const char *json, size_t len,
                     here_flow_t *out, int max, int *count) {
     int ntok = 0, results, n, j, k;
@@ -162,6 +202,8 @@ int here_parse_flow(const char *json, size_t len,
             if (olrv >= 0) {
                 tok_copy(json, &t[olrv], f->olr, sizeof f->olr);
                 f->has_olr = 1;
+                if (olr_first_coord(f->olr, &f->lat, &f->lon))
+                    f->has_coord = 1;
             }
             if (loc >= 0) {
                 int lv = obj_get(json, t, loc, "length");
@@ -255,6 +297,8 @@ int here_parse_incidents(const char *json, size_t len,
             if (olrv >= 0) {
                 tok_copy(json, &t[olrv], inc->olr, sizeof inc->olr);
                 inc->has_olr = 1;
+                if (olr_first_coord(inc->olr, &inc->lat, &inc->lon))
+                    inc->has_coord = 1;
             }
             /* TMC location reference (location.tmc). Resolvable natively on the
              * head unit (on-device TMC table) — the reliable display path. */

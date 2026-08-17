@@ -91,9 +91,15 @@ int  tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
  * concatenated into a primary + extent reference (mirroring native TomTom's
  * 1..30 extents) with one FlowVectorSection per step. Prefer this over calling
  * tpeg_enc_add_flow per item. Returns the number of messages written.
+ *
+ * ref_lat/ref_lon is the car position. When the candidate chains exceed the
+ * single-frame budget, the nearest chains (by OLR-decoded coordinate) are
+ * emitted first so the roads on the visible map are always covered — native
+ * TomTom likewise prioritises flow closest to the vehicle.
  */
 int  tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
-                        unsigned char version, const here_flow_t *flows, int n);
+                        unsigned char version, const here_flow_t *flows, int n,
+                        double ref_lat, double ref_lon);
 
 /* Backpatch the envelope length. Call once, after all messages. */
 void tpeg_enc_finish(tpeg_enc_t *e);

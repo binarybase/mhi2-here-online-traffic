@@ -59,6 +59,14 @@ typedef struct {
     int    tmc_dir;           /* TMC direction bit, INVERTED from HERE's
                                 queuingDirection: "+" -> 1, "-" -> 0          */
     int    tmc_extent;        /* extent (number of TMC steps)               */
+    /* First absolute coordinate decoded from the OLR reference (HERE's OLR is
+     * a 7-byte header followed by lon(3 BE signed) lat(3 BE signed), each
+     * deg = int*360/2^24). Used to order emitted flow by distance to the car
+     * so near-car roads (on the visible map) are always emitted first. 0 if
+     * the OLR could not be decoded.                                          */
+    int    has_coord;         /* 1 if lat/lon decoded from OLR              */
+    double lat;               /* first-point latitude (deg)                 */
+    double lon;               /* first-point longitude (deg)                */
 } here_flow_t;
 
 /* One traffic incident. */
@@ -83,6 +91,12 @@ typedef struct {
     int  tmc_dir;                 /* TMC direction bit, INVERTED from HERE's
                                      queuingDirection: "+" -> 1, "-" -> 0      */
     int  tmc_extent;             /* extent (number of TMC steps)              */
+    /* First absolute coordinate decoded from the OLR reference (see here_flow_t),
+     * used to order the emitted incidents by distance to the car so the head
+     * unit's message list is sorted nearest-first like native. 0 if undecoded. */
+    int    has_coord;             /* 1 if lat/lon decoded from OLR             */
+    double lat;                   /* first-point latitude (deg)                */
+    double lon;                   /* first-point longitude (deg)               */
 } here_incident_t;
 
 /*

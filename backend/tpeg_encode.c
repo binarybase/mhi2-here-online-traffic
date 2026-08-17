@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
 
 /* ---- growable byte buffer ------------------------------------------------ */
 
@@ -542,10 +543,19 @@ static int emit_flow_message(tpeg_enc_t *e, unsigned int id, unsigned char versi
         fputn(e, vb, (size_t)vn);        /* messageID (varint)                */
     }
     fput1(e, version);                   /* versionID                         */
-    fput1(e, (unsigned char)(gen_time >> 24));
-    fput1(e, (unsigned char)(gen_time >> 16));
-    fput1(e, (unsigned char)(gen_time >> 8));
-    fput1(e, (unsigned char)(gen_time));  /* messageExpiryTime (u32 BE)       */
+    /* messageExpiryTime is the END of the validity window. The head unit
+     * derives a flow record's start from the batch/generation time but its end
+     * from this field; setting it equal to gen_time yields a zero-length window
+     * and TtiDataManager::ExpiryTimeFilter treats the message as already
+     * expired, so it is never painted. Native TomTom flow uses a ~1h window
+     * (gen_time + 3600), matching the incident stop_time above. */
+    {
+        unsigned int expiry = gen_time + 3600u;
+        fput1(e, (unsigned char)(expiry >> 24));
+        fput1(e, (unsigned char)(expiry >> 16));
+        fput1(e, (unsigned char)(expiry >> 8));
+        fput1(e, (unsigned char)(expiry));  /* messageExpiryTime (u32 BE)    */
+    }
     fput1(e, 0x00);                      /* flag 0x00 = full (not cancelled)  */
     fputn(e, rest, (size_t)r);           /* FlowMatrix + LRC                  */
 
@@ -742,6 +752,13 @@ int tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
  * max 30) are what makes roads visibly paint. HERE runs reach length 24. */
 #define TPEG_FLOW_CHAIN_EMIT_MAX 30
 
+/* Max gap (in TMC steps) we bridge when chaining. HERE omits locations where
+ * flow is unremarkable, leaving 1-step holes in an otherwise contiguous road;
+ * bridging up to this many steps recovers native-length extents (mean ~6 vs ~3
+ * exact) while never joining across a large gap that would be a different road
+ * or land the extent on an invalid TMC endpoint. */
+#define TPEG_FLOW_CHAIN_MAX_GAP 2
+
 /* Hard ceiling on the whole TPEG envelope. The TISA transport envelope length
  * field (bytes[2:4]) is 16-bit, so an envelope of len16 = total-7 must stay
  * below 0xFFFF; otherwise the head unit's TpegParser reads a truncated length,
@@ -790,7 +807,21 @@ static int tpeg_enc_add_flow_chain(tpeg_enc_t *e, unsigned int gen_time,
     if (nseg > TPEG_FLOW_CHAIN_MAX) nseg = TPEG_FLOW_CHAIN_MAX;
     const here_flow_t *p = segs[0];          /* chain primary                 */
     if (!p->has_tmc) return -1;
-    int ext = nseg;
+
+    /* Detect the TMC step (1 or 2) and set the extent to the step-span from the
+     * primary to the farthest member. Members may have gaps (HERE omits some
+     * locations); the extent bridges them, exactly as native references a whole
+     * road run by primary + extent rather than one code per step. */
+    int step = 1;
+    if (nseg >= 2) {
+        int d = segs[1]->tmc_loc - segs[0]->tmc_loc;
+        if (d < 0) d = -d;
+        if (d == 1 || d == 2) step = d;
+    }
+    int far = segs[nseg - 1]->tmc_loc - segs[0]->tmc_loc;
+    if (far < 0) far = -far;
+    int ext = far / step + 1;
+    if (ext > 30) ext = 30;                  /* native extent range 1..30       */
 
     /* Build FlowVectorSections by merging consecutive same-LOS TMC steps into
      * runs, exactly like native: one section per LevelOfService run spanning
@@ -805,7 +836,10 @@ static int tpeg_enc_add_flow_chain(tpeg_enc_t *e, unsigned int gen_time,
         unsigned char los = los_from_jam(segs[i]->jam_factor);
         double min_speed = segs[i]->speed;
         double ff_sum = 0.0;
-        unsigned int off = (unsigned int)(nseg - i);   /* remaining extent here */
+        int pos = segs[i]->tmc_loc - segs[0]->tmc_loc;   /* step-position of run  */
+        if (pos < 0) pos = -pos;
+        pos /= step;
+        unsigned int off = (unsigned int)(ext - pos);    /* remaining extent here */
         unsigned char ff_vb[5];
         int ff_n, spd_kmh, j = i;
 
@@ -896,6 +930,24 @@ static int flow_chain_cmp(const void *pa, const void *pb) {
     return a->tmc_loc - b->tmc_loc;
 }
 
+/* One same-road chain of HERE flow segments (indices into the sorted ord[]). */
+typedef struct { int start, count, extent; double dist2; } flow_run_t;
+
+/* qsort: nearest chain (to the car) first. Only one SCID=2 flow frame fits
+ * (msgCount is one byte, native emits a single frame), so when candidate chains
+ * outnumber the budget we spend it on the roads closest to the vehicle — the
+ * ones on the visible map — exactly as native TomTom prioritises nearby flow.
+ * Chains without a decoded coordinate (dist2 < 0) sort last. */
+static int flow_run_cmp(const void *pa, const void *pb) {
+    const flow_run_t *a = (const flow_run_t *)pa;
+    const flow_run_t *b = (const flow_run_t *)pb;
+    int au = (a->dist2 < 0.0), bu = (b->dist2 < 0.0);
+    if (au != bu) return au - bu;              /* known-distance chains first  */
+    if (a->dist2 < b->dist2) return -1;
+    if (a->dist2 > b->dist2) return  1;
+    return a->start - b->start;
+}
+
 /* Merge the parsed HERE flow segments into native-style multi-step TMC chains
  * and emit one FlowVector message per chain. HERE returns granular single-step
  * (extent=1) TMC references that mostly fail on-device resolution; consecutive
@@ -909,7 +961,8 @@ static int flow_chain_cmp(const void *pa, const void *pb) {
  * TPEG_FLOW_CHAIN_MAX are split into consecutive sub-chains. Returns the number
  * of messages written. */
 int tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
-                       unsigned char version, const here_flow_t *flows, int n) {
+                       unsigned char version, const here_flow_t *flows, int n,
+                       double ref_lat, double ref_lon) {
     if (e->error || n <= 0) return 0;
 
     const here_flow_t **ord =
@@ -921,28 +974,22 @@ int tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
     if (m == 0) { free(ord); return 0; }
     qsort(ord, (size_t)m, sizeof(*ord), flow_chain_cmp);
 
-    int written = 0;
+    /* Pass 1: partition the sorted segments into same-road chains. TMC tables
+     * use step=1 (motorways) or step=2 (local roads); detect it from the first
+     * pair and require every hop to be a multiple of that step (never join two
+     * different roads). HERE omits locations where flow doesn't change, so we
+     * tolerate small gaps (up to TPEG_FLOW_CHAIN_MAX_GAP steps) and let the
+     * extent span them, exactly as native references a whole road run by primary
+     * + extent. The extent (step-span) is capped at TPEG_FLOW_CHAIN_EMIT_MAX and
+     * the member count at TPEG_FLOW_CHAIN_MAX. */
+    flow_run_t *runs = (flow_run_t *)malloc(sizeof(*runs) * (size_t)m);
+    if (!runs) { free(ord); return 0; }
+    /* Equirectangular scale for cheap distance-squared comparison (ordering
+     * only, no need for a true metric): dx is compressed by cos(latitude). */
+    double coslat = cos(ref_lat * (3.14159265358979323846 / 180.0));
+    int nruns = 0;
     i = 0;
     while (i < m) {
-        /* Keep all flow in ONE SCID=2 frame (native emits a single flow frame);
-         * a mid-stream flush would add a second frame and break native's
-         * SNI/TEC/TFP ordering. See TPEG_FLOW_MSG_MAX. */
-        if (written >= TPEG_FLOW_MSG_MAX)
-            break;
-
-        /* Stop before the envelope's 16-bit length field can overflow. The
-         * projected size is what is already flushed (e->len) plus both pending
-         * frame buffers (incidents + flow not yet wrapped). Once we hit the
-         * budget, drop the remaining flow rather than emit a stream the head
-         * unit will reject wholesale. */
-        if ((size_t)e->len + e->mlen + e->flen >= TPEG_ENVELOPE_BUDGET)
-            break;
-
-        /* Extend a maximal run of consecutive locationIds within one group,
-         * capped so each message stays under the size limits.
-         * TMC tables use either step=1 (motorways) or step=2 (local roads).
-         * Detect the step from the first pair and require consistency so we
-         * never accidentally join codes from two different roads. */
         int run_step = 1;
         if (i + 1 < m &&
             ord[i+1]->tmc_cc  == ord[i]->tmc_cc  &&
@@ -955,25 +1002,67 @@ int tpeg_enc_add_flows(tpeg_enc_t *e, unsigned int gen_time,
         while (j < m &&
                ord[j]->tmc_cc  == ord[i]->tmc_cc  &&
                ord[j]->tmc_ltn == ord[i]->tmc_ltn &&
-               ord[j]->tmc_dir == ord[i]->tmc_dir &&
-               ord[j]->tmc_loc == ord[j - 1]->tmc_loc + run_step &&
-               (j - i) < TPEG_FLOW_CHAIN_EMIT_MAX)
+               ord[j]->tmc_dir == ord[i]->tmc_dir) {
+            int diff = ord[j]->tmc_loc - ord[j - 1]->tmc_loc;
+            if (diff <= 0 || diff % run_step != 0)             break;
+            if (diff / run_step > TPEG_FLOW_CHAIN_MAX_GAP)      break;  /* gap too big */
+            if ((ord[j]->tmc_loc - ord[i]->tmc_loc) / run_step
+                    >= TPEG_FLOW_CHAIN_EMIT_MAX)               break;  /* extent cap  */
+            if ((j - i) >= TPEG_FLOW_CHAIN_MAX - 1)            break;  /* member cap  */
             j++;
-        int run = j - i;
-
-        /* Order the run from the chain primary outward. */
-        const here_flow_t *chain[TPEG_FLOW_CHAIN_MAX];
-        int k;
-        if (ord[i]->tmc_dir == 0) {                 /* dir 0 : primary = lowest  */
-            for (k = 0; k < run; k++) chain[k] = ord[i + k];
-        } else {                                    /* dir 1 : primary = highest */
-            for (k = 0; k < run; k++) chain[k] = ord[i + run - 1 - k];
         }
-        if (tpeg_enc_add_flow_chain(e, gen_time, version, chain, run) == 0)
-            written++;
+        runs[nruns].start  = i;
+        runs[nruns].count  = j - i;
+        runs[nruns].extent = (ord[j-1]->tmc_loc - ord[i]->tmc_loc) / run_step + 1;
+        /* Nearest member's distance-squared to the car (equirectangular). Chains
+         * with no OLR-decoded coordinate get -1 and sort last. */
+        {
+            double best = -1.0;
+            int q;
+            for (q = i; q < j; q++) {
+                if (!ord[q]->has_coord) continue;
+                double dx = (ord[q]->lon - ref_lon) * coslat;
+                double dy = (ord[q]->lat - ref_lat);
+                double d2 = dx * dx + dy * dy;
+                if (best < 0.0 || d2 < best) best = d2;
+            }
+            runs[nruns].dist2 = best;
+        }
+        nruns++;
         i = j;
     }
 
+    /* Pass 2: emit nearest chains first, within the single-frame message count
+     * and the envelope's 16-bit length budget, so the visible map is covered. */
+    qsort(runs, (size_t)nruns, sizeof(*runs), flow_run_cmp);
+
+    int written = 0, ri;
+    for (ri = 0; ri < nruns; ri++) {
+        /* Keep all flow in ONE SCID=2 frame (native emits a single flow frame);
+         * a second frame would break native's SNI/TEC/TFP ordering and tag the
+         * flow aId0 (route-gated, dropped) instead of aId7. See TPEG_FLOW_MSG_MAX. */
+        if (written >= TPEG_FLOW_MSG_MAX)
+            break;
+
+        /* Stop before the envelope's 16-bit length field can overflow (already
+         * flushed bytes plus both pending frame buffers). */
+        if ((size_t)e->len + e->mlen + e->flen >= TPEG_ENVELOPE_BUDGET)
+            break;
+
+        int s = runs[ri].start, run = runs[ri].count, k;
+
+        /* Order the run from the chain primary outward. */
+        const here_flow_t *chain[TPEG_FLOW_CHAIN_MAX];
+        if (ord[s]->tmc_dir == 0) {                 /* dir 0 : primary = lowest  */
+            for (k = 0; k < run; k++) chain[k] = ord[s + k];
+        } else {                                    /* dir 1 : primary = highest */
+            for (k = 0; k < run; k++) chain[k] = ord[s + run - 1 - k];
+        }
+        if (tpeg_enc_add_flow_chain(e, gen_time, version, chain, run) == 0)
+            written++;
+    }
+
+    free(runs);
     free(ord);
     return written;
 }
