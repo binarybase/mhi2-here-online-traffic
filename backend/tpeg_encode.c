@@ -346,12 +346,13 @@ static void flush_tfp_frame(tpeg_enc_t *e);
 #define TPEG_FLOW_FRAME_MSGS 250
 
 /* Number of SCID=2 flow frames we allow per stream. Native TomTom emits ONE
- * (~77 msgs). We EXPERIMENT with 2 to roughly double the flow budget now that
- * flow renders (green roads) — the historic aId0 dropping came from 9 frames on
- * an oversized, length-overflowed transport envelope, both since fixed; two
- * well-formed frames under the 60 KB budget stay well within the 16-bit
- * transport length. Set back to 1 to restore native single-frame behaviour. */
-#define TPEG_FLOW_FRAMES 2
+ * (~77 msgs). We EXPERIMENT with 4 to raise the flow budget now that flow
+ * renders (green roads) — the historic aId0 dropping came from 9 frames on
+ * an oversized, length-overflowed transport envelope, both since fixed; the
+ * TPEG_ENVELOPE_BUDGET guard still caps total size under the 16-bit transport
+ * length, so extra frames only fill the remaining headroom. Set back to 1 to
+ * restore native single-frame behaviour. */
+#define TPEG_FLOW_FRAMES 4
 
 /* Total flow (TFP) messages across all frames. */
 #define TPEG_FLOW_MSG_MAX (TPEG_FLOW_FRAME_MSGS * TPEG_FLOW_FRAMES)
@@ -793,7 +794,7 @@ int tpeg_enc_add_flow(tpeg_enc_t *e, unsigned int gen_time,
  * 885 unique locations; here_tmc_flow/log_0003, 2026-07-19). We stop adding flow
  * once the projected size (already-emitted + both pending frame buffers) reaches
  * this budget, well under 65535, leaving room for the final CRC/framing bytes. */
-#define TPEG_ENVELOPE_BUDGET 60000
+#define TPEG_ENVELOPE_BUDGET 62000
 
 /* Flow message budget (TPEG_FLOW_MSG_MAX) and per-frame split are defined near
  * the top of this file, before emit_flow_message. Native emits ONE SCID=2 frame
