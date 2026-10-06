@@ -39,6 +39,10 @@ PORT="${PORT:-8099}"
 LSD_SH="/mnt/app/eso/hmi/lsd/lsd.sh"
 LSD_MARK="traffic-backend-autostart"
 
+# QNX ARMv7 cross-toolchain Docker image (GCC 8.5.0, C++17) — preferred over the
+# QEMU VM below. mbedTLS is vendored under thirdparty/ (same toolchain/flags).
+QNX_IMAGE="${QNX_IMAGE:-qnx65-armv7-toolchain:8.5}"
+
 # QNX SDP QEMU VM (same params as mmi-webradio Makefile)
 QNX_SSH=(sshpass -p "root" ssh -o StrictHostKeyChecking=no \
     -o HostKeyAlgorithms=+ssh-rsa \
@@ -85,6 +89,18 @@ compile() {
     file "${BUILD_DIR}/${BIN_NAME}" 2>/dev/null || true
 }
 
+# Cross-compile with the GCC 8.5 QNX Docker toolchain (no QEMU VM). Mounts this
+# backend/ dir at /src and runs build_qnx_docker.sh inside the container.
+compile_docker() {
+    echo "== cross-compiling ${BIN_NAME} with ${QNX_IMAGE} (GCC 8.5) =="
+    command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found"; exit 3; }
+    docker run --rm --platform=linux/amd64 -v "${here}":/src "${QNX_IMAGE}" \
+        sh build_qnx_docker.sh "${1:-}"
+    echo "-- result --"
+    ls -lh "${BUILD_DIR}/${BIN_NAME}"
+    file "${BUILD_DIR}/${BIN_NAME}" 2>/dev/null || true
+}
+
 deploy() {
     echo "== deploying ${BIN_NAME} to car (${MHI2}) =="
     ssh "${MHI2}" "mount -uw /mnt/app && mkdir -p $(dirname ${MHI2_BIN}) /mnt/app/armle/etc"
@@ -103,7 +119,7 @@ deploy() {
 
 start() {
     echo "== starting ${BIN_NAME} on car =="
-    ssh "${MHI2}" "LD_LIBRARY_PATH=${MHI2_LIB}:/usr/lib ${MHI2_BIN} -b ${BIND_IP} -p ${PORT} >> /tmp/traffic_backend.log 2>&1 &" \
+    ssh "${MHI2}" "LD_LIBRARY_PATH=${MHI2_LIB}:/usr/lib ${MHI2_BIN} -b ${BIND_IP} -p ${PORT} >/dev/null 2>&1 &" \
         && echo "started on ${BIND_IP}:${PORT}"
 }
 
@@ -129,7 +145,7 @@ autostart_install() {
         cp ${LSD_SH} ${LSD_SH}.traffic.bak; \
         echo '' >> ${LSD_SH}; \
         echo '# ${LSD_MARK}' >> ${LSD_SH}; \
-        echo '( sleep 10 && while true; do export LD_LIBRARY_PATH=${MHI2_LIB}:/usr/lib; ${MHI2_BIN} -b ${BIND_IP} -p ${PORT} >> /tmp/traffic_backend.log 2>&1; sleep 5; done ) &' >> ${LSD_SH}; \
+        echo '( sleep 10 && while true; do export LD_LIBRARY_PATH=${MHI2_LIB}:/usr/lib; ${MHI2_BIN} -b ${BIND_IP} -p ${PORT} >/dev/null 2>&1; sleep 5; done ) &' >> ${LSD_SH}; \
         echo 'lsd.sh updated - reboot to activate'"
 }
 
@@ -173,8 +189,11 @@ host_build() {
 cmd="${1:-all}"
 case "${cmd}" in
     compile)            compile ;;
+    compile-docker)     compile_docker ;;
+    compile-docker-clean) compile_docker clean ;;
     deploy)             deploy ;;
     all)                compile; deploy ;;
+    all-docker)         compile_docker; deploy ;;
     start)              start ;;
     stop)               stop ;;
     restart)            restart ;;
@@ -185,5 +204,5 @@ case "${cmd}" in
     host-build)         host_build ;;
     autostart-install)  autostart_install ;;
     autostart-remove)   autostart_remove ;;
-    *) echo "Usage: $0 <compile|deploy|all|start|stop|restart|log|status|here-test|enc-test|host-build|autostart-install|autostart-remove>"; exit 2 ;;
+    *) echo "Usage: $0 <compile|compile-docker|compile-docker-clean|deploy|all|all-docker|start|stop|restart|log|status|here-test|enc-test|host-build|autostart-install|autostart-remove>"; exit 2 ;;
 esac
