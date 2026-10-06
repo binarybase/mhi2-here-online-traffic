@@ -82,17 +82,35 @@ static const int FREQ_SHORT_S = 30;
 // 50 km is HERE's maximum allowed circle radius and returns ~180 incidents,
 // covering a comparable region.
 static const int  HERE_RADIUS_M = 50000;
+// Adaptive flow circle. HERE's flow response balloons in dense cities: ~6 MB
+// decoded (1.1 MB gzipped) at 50 km over Prague, vs ~2.5 MB at 15 km, and rural
+// 50 km is small (few segments). A multi-MB burst every poll over the car's
+// tethered link destabilises it, so we shrink the FLOW radius hard where
+// incidents are dense and only keep the full 50 km where they're sparse
+// (rural/highway, where the payload is small anyway). Incidents always use the
+// full HERE_RADIUS_M so the message list stays comparable to native.
+static const int  FLOW_RADIUS_URBAN_M = 15000;
+static const int  FLOW_RADIUS_MID_M   = 30000;
+static const int  FLOW_RADIUS_RURAL_M = 50000;
 // Max incidents pulled per request.
 static const int  HERE_MAX_INCIDENTS = 256;
-// Max flow segments pulled per request. HERE returns ~2700 segments for the
-// 50 km circle; only ~25% carry a TMC code the car's table can resolve. The
-// encoder caps the actual emitted volume to keep the TPEG envelope under the
-// 16-bit length limit (TPEG_ENVELOPE_BUDGET) — a larger stream is rejected
-// wholesale by the head unit's parser (checksum failure), so this is just the
-// candidate pool the encoder fills that budget from.
-static const int  HERE_MAX_FLOW = 4096;
+// Flow candidate pool the encoder fills the emit budget from, nearest-first.
+// Sized to hold the whole urban 15 km circle (~4950 segments) without HERE-order
+// truncation, so the nearest-first selection sees every near-car segment before
+// picking the emit budget. Only ~9% of Czech (table 25) codes resolve on this
+// unit's TMC table, so this is a generous candidate pool, not the emitted count
+// (that is TPEG_FLOW_MSG_MAX).
+static const int  HERE_MAX_FLOW = 5120;
 
 static FILE* g_log = NULL;
+static const char* g_logfile = NULL;   // log path, for size-capped rotation
+// /tmp is /dev/shmem (RAM) on this unit, so an unbounded log would consume RAM
+// over a long drive. Truncate it once it passes this size.
+static const long LOG_MAX_BYTES = 256 * 1024;
+// Per-poll request/response dumps to /tmp (also RAM). OFF by default so a long
+// drive can't fill shmem; enable for bench debugging via OT_CAPTURE or the flag
+// file /tmp/ot_capture (checked once at startup).
+static bool g_capture = false;
 static std::string g_here_key;   // HERE apiKey (loaded at startup; never logged)
 
 static void logf(const char* fmt, ...) {
@@ -113,6 +131,12 @@ static void logf(const char* fmt, ...) {
     fprintf(out, "\n");
     fflush(out);
     va_end(ap);
+
+    // Keep the RAM-backed log bounded: truncate in place when it grows too big.
+    if (g_log && g_logfile && ftell(g_log) > LOG_MAX_BYTES) {
+        FILE* nf = freopen(g_logfile, "w", g_log);
+        if (nf) g_log = nf;
+    }
 }
 
 // ── zlib gunzip (auto-detects gzip or zlib headers). ──────────────────────────
@@ -268,10 +292,25 @@ static int inc_dist_cmp(const void *pa, const void *pb) {
     return 0;
 }
 
+// Choose the flow query radius from local incident density: the distance to the
+// k-th nearest incident is small in a city and large in open country. `incs`
+// must already be sorted nearest-first; incidents without a decoded coordinate
+// sort last, so a far/absent k-th point safely falls back to the rural radius.
+static int pick_flow_radius(const here_incident_t* incs, int n,
+                            double lat, double lon) {
+    const int K = 150;                       // need this many to call it "urban"
+    if (n < K) return FLOW_RADIUS_RURAL_M;
+    double coslat = cos(lat * (3.14159265358979323846 / 180.0));
+    double dx = (incs[K - 1].lon - lon) * coslat, dy = incs[K - 1].lat - lat;
+    double dk_km = sqrt(dx * dx + dy * dy) * 111.32;   // degrees -> km
+    if (dk_km <= 30.0) return FLOW_RADIUS_URBAN_M;     // 150 incidents in 30 km
+    if (dk_km <= 60.0) return FLOW_RADIUS_MID_M;
+    return FLOW_RADIUS_RURAL_M;
+}
+
 // Fetch HERE incidents around (lat,lon), encode them into a TPEG stream.
 // Returns true and fills `out` on success; false => caller falls back to empty.
 static bool build_tpeg_response(double lat, double lon, std::string& out) {
-    if (g_here_key.empty()) return false;
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -336,6 +375,7 @@ static bool build_tpeg_response(double lat, double lon, std::string& out) {
     // Skip it entirely if the incidents fetch already ran long, so a degraded
     // link doesn't stack a second multi-second stall onto this poll.
     int flow_written = 0;
+    int flow_radius_km = 0;
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long inc_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
@@ -345,7 +385,9 @@ static bool build_tpeg_response(double lat, double lon, std::string& out) {
              inc_ms);
     } else {
         std::string fjson;
-        int fstatus = here_fetch("flow", lat, lon, HERE_RADIUS_M,
+        int flow_radius = pick_flow_radius(incs, n, lat, lon);
+        flow_radius_km = flow_radius / 1000;
+        int fstatus = here_fetch("flow", lat, lon, flow_radius,
                                  g_here_key.c_str(), fjson);
         if (fstatus == 200 && !fjson.empty()) {
             here_flow_t* flows =
@@ -376,9 +418,9 @@ static bool build_tpeg_response(double lat, double lon, std::string& out) {
     clock_gettime(CLOCK_MONOTONIC, &t2);
     long total_ms = (t2.tv_sec - t0.tv_sec) * 1000L +
                     (t2.tv_nsec - t0.tv_nsec) / 1000000L;
-    logf("  HERE: %d incidents (%d w/OLR) + %d flow -> %lu-byte TPEG "
+    logf("  HERE: %d incidents (%d w/OLR) + %d flow (flowR %d km) -> %lu-byte TPEG "
          "(inc %ld ms, total %ld ms)",
-         count, written, flow_written, (unsigned long) enc.len,
+         count, written, flow_written, flow_radius_km, (unsigned long) enc.len,
          inc_ms, total_ms);
 
     tpeg_enc_free(&enc);
@@ -464,12 +506,14 @@ static void handle_conn(int fd) {
             logf("  request XML (%lu bytes gz -> %lu bytes):",
                  (unsigned long) body.size(), (unsigned long) xml.size());
             log_position(xml);
-            save_capture(tid, (const unsigned char*) body.data(), body.size(), xml);
+            if (g_capture)
+                save_capture(tid, (const unsigned char*) body.data(), body.size(), xml);
             req_xml = xml;
         } else {
             logf("  request body not gzip (%lu bytes) — key may still be set",
                  (unsigned long) body.size());
-            save_capture(tid, (const unsigned char*) body.data(), body.size(), std::string());
+            if (g_capture)
+                save_capture(tid, (const unsigned char*) body.data(), body.size(), std::string());
         }
     }
 
@@ -540,7 +584,7 @@ static void handle_conn(int fd) {
 
     write_all(fd, hdr, (size_t) hlen);
     write_all(fd, (const char*) resp_body, (size_t) resp_body_len);
-    if (!tpeg.empty()) save_response(tid, resp_body, (size_t) resp_body_len);
+    if (g_capture && !tpeg.empty()) save_response(tid, resp_body, (size_t) resp_body_len);
     logf("  -> 200 OK, %d-byte TPEG, tid=%d", resp_body_len, resp_tid);
 }
 
@@ -674,6 +718,7 @@ int main(int argc, char** argv) {
     const char* bind_ip = "0.0.0.0";
     int port = 8099;
     const char* logfile = "/tmp/traffic_backend.log";
+    bool logfile_explicit = false;
     const char* keyfile = "/mnt/app/armle/etc/here.key";
     bool selftest = false;
     bool dump = false;
@@ -683,7 +728,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-b") && i + 1 < argc) bind_ip = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-l") && i + 1 < argc) logfile = argv[++i];
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc) { logfile = argv[++i]; logfile_explicit = true; }
         else if (!strcmp(argv[i], "-k") && i + 1 < argc) keyfile = argv[++i];
         else if (!strcmp(argv[i], "-T")) selftest = true;
         else if (!strcmp(argv[i], "-D") && i + 3 < argc) {
@@ -709,7 +754,18 @@ int main(int argc, char** argv) {
         return selftest_client(host, port) ? 0 : 1;
     }
 
-    g_log = fopen(logfile, "a");
+    // File logging goes to /tmp (RAM-backed shmem), so it's opt-in to avoid
+    // filling RAM on a long drive. Enabled by an explicit -l, OT_LOG, or the
+    // flag file /tmp/ot_log. Otherwise logf() falls through to stderr (which the
+    // daemon sends to /dev/null), so nothing is written to /tmp.
+    if (logfile_explicit || getenv("OT_LOG") || access("/tmp/ot_log", F_OK) == 0) {
+        g_log = fopen(logfile, "a");
+        g_logfile = logfile;
+    }
+    // Per-poll /tmp dumps are opt-in (bench only) so they can't fill shmem on a
+    // long drive. Enable with OT_CAPTURE=1 or by creating /tmp/ot_capture.
+    if (getenv("OT_CAPTURE") || access("/tmp/ot_capture", F_OK) == 0)
+        g_capture = true;
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { logf("socket() failed: %s", strerror(errno)); return 1; }
