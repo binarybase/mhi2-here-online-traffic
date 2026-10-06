@@ -130,18 +130,54 @@ public class PatchOnlineTraffic {
         // Map of "internal/name.class" -> patched bytecode.
         Map patched = new HashMap();
 
-        // ── Patch (1): HR -> SI remap in createTrafficSession ──────────────────
+        // ── Patch (1): createTrafficSession — offline session mint + HR->SI ────
+        // $1=OnlineTrafficImpl tr, $2=currentCountry, $3=destCountry.
+        // When the HERE flag file is present we build the TrafficSession LOCALLY
+        // from a synthetic <trafficSessionResponse> and return BEFORE the core
+        // getConnectionFactory().http_method("GET","traffic-online_v1",...) call.
+        // That core call resolves the service name via Audi's serviceList
+        // (service discovery), which fails with ERRORCODE_CONNECTIVITY_ERROR when
+        // Audi Connect's backend is unreachable — the exact "createSession
+        // CoreServiceException" regression. Minting the session offline makes the
+        // online-traffic path independent of Audi Connect (data is then POSTed to
+        // our backend, whose URL/key TrafficSession.getURL/getEncryptionKey
+        // already return when the flag is present). Flag absent => stock path.
         {
             CtClass cc = cp.get(EVENT_CLASS);
             if (cc.isFrozen()) cc.defrost();
             CtMethod m = cc.getDeclaredMethod(EVENT_METHOD);
-            // $2 = currentCountry, $3 = destCountry  ($0=this, $1=OnlineTrafficImpl)
+            String bypass = "";
+            if (doRedirect) {
+                if (redirectUrl.indexOf('"') >= 0 || redirectUrl.indexOf('\\') >= 0) {
+                    System.err.println("redirectUrl contains illegal characters: " + redirectUrl);
+                    System.exit(2);
+                }
+                // Minimal valid session XML. getURL()/getEncryptionKey() are
+                // overridden (Patch 2) to our backend + null key when the flag is
+                // present, so only a well-formed root + a <url> fallback matter.
+                String synthXml =
+                        "<trafficSessionResponse><url>" + redirectUrl + "</url>"
+                      + "<sessionId>LOCAL</sessionId></trafficSessionResponse>";
+                bypass =
+                    "  if (new java.io.File(\"" + flagFile + "\").exists()) {"
+                  + "    de.eso.mib.online.onlinetraffic.impl.TrafficSession __ts ="
+                  + "        new de.eso.mib.online.onlinetraffic.impl.TrafficSession("
+                  + "            $1.getsessionDuration(),"
+                  + "            (java.io.Reader) new java.io.StringReader(\"" + synthXml + "\"));"
+                  + "    de.eso.mib.online.onlinetraffic.Activator.getOnlineTrafficImpl().setTrafficSession(__ts);"
+                  + "    de.eso.mib.online.onlinetraffic.Activator.getOnlineTrafficImpl().setWaitIntervall(0L);"
+                  + "    $1.setSessionHTTPCode(\"200\");"
+                  + "    return;"
+                  + "  }";
+            }
             String snippet =
-                    "{ if (\"HR\".equals($2)) { $2 = \"" + remapTo + "\"; }"
+                    "{" + bypass
+                  + "  if (\"HR\".equals($2)) { $2 = \"" + remapTo + "\"; }"
                   + "  if (\"HR\".equals($3)) { $3 = \"" + remapTo + "\"; } }";
             m.insertBefore(snippet);
             patched.put(EVENT_CLASS.replace('.', '/') + ".class", cc.toBytecode());
-            System.out.println("OK (1): HR->" + remapTo + " remap injected into " + EVENT_METHOD);
+            System.out.println("OK (1): createTrafficSession patched (HR->" + remapTo
+                    + (doRedirect ? "; offline session mint when flag=" + flagFile : "") + ")");
         }
 
         // ── Patch (2): runtime TOGGLE — override getURL + getEncryptionKey ────
