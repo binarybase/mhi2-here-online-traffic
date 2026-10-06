@@ -4,8 +4,6 @@ here.key
 tomtom.key
 .here_key
 .tomtom_key
-.env
-.env.*
 
 # ── Proprietary Audi firmware (extract your own; do not redistribute) ────
 firmware/
@@ -13,19 +11,26 @@ firmware/
 *.kzb
 
 # ── Captured third-party API data (HERE/TomTom responses) ────────────────
-screenshots/
 backend/samples/
 *.tpg
 traffic_data.*
-backend/tools/
-backend/docs/
-backend/trace/
 
 # ── Build artifacts ──────────────────────────────────────────────────────
 build/
 backend/build/
+backend/thirdparty/
 *.o
 *.class
 
 # ── OS / editor ──────────────────────────────────────────────────────────
 .DS_Store
+.env
+.env.local
+**/*.esotrace
+*.log
+*.jpeg
+*.pdf
+tools/
+backend/docs/
+docs/
+*.txt
